@@ -1,0 +1,8 @@
+streamlit>=1.37,<2
+numpy>=1.26,<3
+pandas>=2.0,<3
+Pillow>=10,<13
+opencv-python-headless>=4.8,<5
+scipy>=1.11,<2
+scikit-image>=0.22,<1
+matplotlib>=3.8,<4
