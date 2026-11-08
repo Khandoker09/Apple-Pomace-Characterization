@@ -28,7 +28,14 @@ from skimage.segmentation import watershed
 from matplotlib.figure import Figure
 
 TITLE='DryMatter Vision'
-CREDIT='Maintained by Khandakar Tanjima Ahmed · Institute of Agritechnic'
+CREDIT = '''Maintained by Khandoker Tanjim Ahammad
+Doctoral Researcher
+University of Hohenheim
+Institute of Agricultural Engineering
+Agricultural Engineering in the Tropics and Subtropics
+
+'''
+
 DARK='#172C3A'
 BG='#EFF3F7'
 PANEL='#FFFFFF'
