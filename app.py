@@ -1,7 +1,8 @@
-"""DryMatter Vision: three analyses only.
+"""DryMatter Vision: four analyses.
 1. Automatic tray-guided material mask
 2. Mean candidate-region area reduction
-3. Camera-based CIELAB colour change
+3. Camera-based CIELAB color quality control
+4. Numbered candidate-region segmentation and size distribution
 
 Research limitation: watershed regions are not validated physical particles.
 Top-down photos do not measure thickness or volume.
@@ -11,6 +12,8 @@ import io
 import json
 import zipfile
 from datetime import datetime, timezone
+import colorsys
+from matplotlib.figure import Figure
 import cv2
 import numpy as np
 import pandas as pd
@@ -244,6 +247,99 @@ def visual_overlay(r: dict) -> np.ndarray:
     return img
 
 
+
+def colored_region_overlay(result: dict, show_numbers: bool = True) -> np.ndarray:
+    """Display individual watershed candidate regions with stable ID labels."""
+    rgb = result['rgb'].copy()
+    labels = result['labels']
+    count = int(labels.max())
+    if count == 0:
+        return rgb
+    palette = np.zeros((count + 1, 3), dtype=np.uint8)
+    for idx in range(1, count + 1):
+        hue = (idx * 0.61803398875 + 0.13) % 1.0
+        palette[idx] = np.uint8(np.array(colorsys.hsv_to_rgb(hue, .80, .96)) * 255)
+    painted = palette[labels]
+    active = labels > 0
+    rgb[active] = np.clip(.20 * rgb[active] + .80 * painted[active], 0, 255).astype(np.uint8)
+    border = np.zeros(active.shape, dtype=bool)
+    border[1:, :] |= (labels[1:, :] != labels[:-1, :]) & active[1:, :]
+    border[:, 1:] |= (labels[:, 1:] != labels[:, :-1]) & active[:, 1:]
+    rgb[border] = (15, 27, 38)
+    if show_numbers:
+        for region in regionprops(labels):
+            cy, cx = region.centroid
+            label = str(region.label)
+            x, y = int(round(cx)), int(round(cy))
+            scale = 0.27 if rgb.shape[1] < 850 else 0.40
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+            xy = (x - tw // 2, y + th // 2)
+            cv2.putText(rgb, label, xy, cv2.FONT_HERSHEY_SIMPLEX, scale,
+                        (18, 20, 28), 2, cv2.LINE_AA)
+            cv2.putText(rgb, label, xy, cv2.FONT_HERSHEY_SIMPLEX, scale,
+                        (255, 255, 255), 1, cv2.LINE_AA)
+    return rgb
+
+
+def region_measurements(w: dict, d: dict, scale: float | None) -> pd.DataFrame:
+    """One row per candidate image region; shared size thresholds for both photos."""
+    mm2 = scale**2 if scale is not None else 1.0
+    unit = 'mm²' if scale is not None else 'px²'
+    records = []
+    for condition, result in [('Wet', w), ('Dry', d)]:
+        for region in regionprops(result['labels']):
+            records.append({
+                'Condition': condition,
+                'Region ID': int(region.label),
+                f'Area ({unit})': float(region.area * mm2),
+                'Area (px²)': float(region.area),
+                'Centroid X (px)': float(region.centroid[1]),
+                'Centroid Y (px)': float(region.centroid[0]),
+                f'Equivalent diameter ({"mm" if scale is not None else "px"})':
+                    float(region.equivalent_diameter_area * (scale or 1.0)),
+                'Circularity': min(1.0, float(4 * np.pi * region.area / region.perimeter**2))
+                    if region.perimeter > 0 else 0.0,
+            })
+    df = pd.DataFrame(records)
+    if df.empty:
+        df['Size class'] = pd.Series(dtype='object')
+        return df
+    vals = df[f'Area ({unit})'].to_numpy()
+    low, high = np.percentile(vals, [33.33, 66.67])
+    # Shared quantile cutoffs describe this photo pair; not fixed physical thresholds.
+    df['Size class'] = np.where(vals < low, 'Small', np.where(vals < high, 'Medium', 'Large'))
+    return df
+
+
+def distribution_figure(df: pd.DataFrame, area_column: str) -> Figure:
+    fig = Figure(figsize=(10, 4.7), dpi=110, facecolor='white')
+    ax = fig.add_subplot(111)
+    samples = [df.loc[df['Condition'] == cond, area_column].to_numpy()
+               for cond in ('Wet', 'Dry')]
+    full = np.concatenate(samples) if any(len(a) for a in samples) else np.array([])
+    if full.size:
+        # Clip histogram display at 99th percentile but keep original measurements in CSV.
+        top = max(float(np.percentile(full, 99)), float(np.max(full)) * .10, 1e-8)
+        bins = np.linspace(0, top, 27)
+        for values, color, title in zip(samples, ('#007F90', '#C66A34'), ('Wet', 'Dry')):
+            ax.hist(np.clip(values, 0, top - 1e-9), bins=bins, alpha=.55,
+                    color=color, label=title)
+    ax.set_xlabel(f'Candidate region area ({"mm²" if "mm²" in area_column else "px²"})')
+    ax.set_ylabel('Number of detected candidate regions')
+    ax.set_title('Wet vs dry candidate-region size distribution', loc='left')
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    return fig
+
+
+def class_counts(df: pd.DataFrame) -> pd.DataFrame:
+    categories = ['Small', 'Medium', 'Large']
+    return pd.DataFrame({
+        'Size class': categories,
+        'Wet': [int(((df['Condition'] == 'Wet') & (df['Size class'] == cl)).sum()) for cl in categories],
+        'Dry': [int(((df['Condition'] == 'Dry') & (df['Size class'] == cl)).sum()) for cl in categories]
+    })
+
 def png(rgb: np.ndarray) -> bytes:
     out = io.BytesIO()
     Image.fromarray(rgb.astype(np.uint8)).save(out, format='PNG')
@@ -254,7 +350,7 @@ def ratio_reduction(before: float, after: float) -> float:
     return 100.0 * (before - after) / before if before > 0 else float('nan')
 
 
-def make_export(w: dict, d: dict, shared_scale: float | None, report: dict) -> bytes:
+def make_export(w: dict, d: dict, shared_scale: float | None, report: dict, regions: pd.DataFrame) -> bytes:
     stream = io.BytesIO()
     with zipfile.ZipFile(stream, 'w', zipfile.ZIP_DEFLATED) as z:
         z.writestr('summary.json', json.dumps(report, indent=2, ensure_ascii=False))
@@ -263,16 +359,19 @@ def make_export(w: dict, d: dict, shared_scale: float | None, report: dict) -> b
             z.writestr(f'{name}_mask.png', png(np.where(r['mask'][..., None], 255, 0)
                                                   .astype(np.uint8).repeat(3, axis=2)))
             z.writestr(f'{name}_overlay.png', png(visual_overlay(r)))
+            z.writestr(f'{name}_numbered_regions.png', png(colored_region_overlay(r)))
             for i, a in enumerate(r['region_px2'], 1):
                 rows.append(dict(condition=name, candidate_region_id=i,
                                  area_px2=float(a),
                                  area_mm2=float(a * shared_scale**2) if shared_scale else None))
         z.writestr('candidate_region_areas.csv', pd.DataFrame(rows).to_csv(index=False))
+        z.writestr('individual_candidate_regions.csv', regions.to_csv(index=False))
+        z.writestr('size_class_distribution.csv', class_counts(regions).to_csv(index=False))
     return stream.getvalue()
 
-st.set_page_config(page_title='DryMatter Vision | Three Measures', page_icon='🔬', layout='wide')
+st.set_page_config(page_title='DryMatter Vision | Four Measures', page_icon='🔬', layout='wide')
 st.title('DryMatter Vision')
-st.caption('Automatic material mask · mean candidate-region area reduction · color change')
+st.caption('Automatic material mask · mean area reduction · color quality control · individual-region distribution')
 with st.sidebar:
     st.header('Upload photographs')
     wet_file = st.file_uploader('Wet / Before', type=['jpg','jpeg','png','webp','tif','tiff'], key='wet')
@@ -335,7 +434,7 @@ with st.expander('Ruler detection details'):
     st.write('Wet:', res['wet_msg'])
     st.write('Dry:', res['dry_msg'])
 
-mask_tab, area_tab, color_tab = st.tabs(['1. Material mask', '2. Mean area reduction', '3. Color change'])
+mask_tab, area_tab, color_tab, particle_tab = st.tabs(['1. Material mask', '2. Mean area reduction', '3. Quality control', '4. Individual regions & distribution'])
 with mask_tab:
     st.subheader('Automatic material-only masks')
     st.caption('Green = material-classified pixels; magenta = their boundaries. Silver gaps remain unmasked where the classifier can distinguish them.')
@@ -365,7 +464,7 @@ with area_tab:
     st.warning('These are watershed image regions, not verified individual particles. A positive mean reduction is not proof of physical particle or volume shrinkage. Negative results are not overwritten.')
 
 with color_tab:
-    st.subheader('Mean CIELAB color change')
+    st.subheader('Quality control — color change')
     st.latex(r'\Delta E^*_{76}=\sqrt{(\Delta L^*)^2+(\Delta a^*)^2+(\Delta b^*)^2}')
     c1,c2,c3 = st.columns(3)
     c1.metric('Mean color difference ΔE*76', f'{delta_e:.2f}')
@@ -376,7 +475,32 @@ with color_tab:
         dict(Condition='Dry', **{'L*':d['lab'][0],'a*':d['lab'][1],'b*':d['lab'][2]}),
         dict(Condition='Dry minus wet', **{'L*':delta_lab[0],'a*':delta_lab[1],'b*':delta_lab[2]}),
     ]), hide_index=True, use_container_width=True)
-    st.caption('Camera-derived CIELAB approximations, not spectrophotometer measurements. Matched lighting, exposure and white balance are required for robust comparisons.')
+    st.caption('A lighter dry sample may suggest incomplete drying in your process, but no color-only threshold can establish moisture content without calibration. Darkening can also arise from oxidation or heating. Camera-derived CIELAB estimates require matched lighting, exposure, and white balance.')
+
+
+regions = region_measurements(w, d, mm)
+area_column = 'Area (mm²)' if mm is not None else 'Area (px²)'
+with particle_tab:
+    st.subheader('Numbered candidate regions')
+    st.caption('Every colored patch receives a unique ID matching the measurement table. These watershed patches are not proven to be distinct physical particles.')
+    wet_col, dry_col = st.columns(2)
+    with wet_col:
+        st.markdown(f'**WET — {nw} regions**')
+        st.image(colored_region_overlay(w), use_container_width=True)
+    with dry_col:
+        st.markdown(f'**DRY — {nd} regions**')
+        st.image(colored_region_overlay(d), use_container_width=True)
+    st.subheader('Region area distribution')
+    st.pyplot(distribution_figure(regions, area_column), use_container_width=True)
+    st.caption('The histogram is capped at the 99th percentile for readability; the CSV retains the complete original region areas.')
+    st.subheader('Shared size-class distribution')
+    st.caption('Small, medium, and large use common percentile thresholds from BOTH images. They are pair-relative categories, not fixed millimeter ranges.')
+    st.dataframe(class_counts(regions), use_container_width=True, hide_index=True)
+    st.subheader('Individual-region measurements')
+    st.dataframe(regions.round(3), use_container_width=True, hide_index=True, height=430)
+    st.download_button('Download individual-region measurements (CSV)',
+                       data=regions.to_csv(index=False).encode('utf-8-sig'),
+                       file_name='DryMatter_Individual_Regions.csv', mime='text/csv')
 
 report = {
     'date_utc': datetime.now(timezone.utc).isoformat(),
@@ -392,8 +516,9 @@ report = {
     'total_projected_material_area_reduction_pct': area_reduction,
     'delta_E76': delta_e,
     'delta_Lab': delta_lab.tolist(),
+    'size_class_distribution': class_counts(regions).to_dict(orient='records'),
     'limitation':'2D camera masks; watershed candidate regions are not verified physical particles. No 3D volume shrinkage is inferred.'
 }
-st.download_button('Download masks, region areas and report (ZIP)',
-                   make_export(w,d,mm,report), file_name='DryMatter_Vision_Results.zip',
+st.download_button('Download masks, numbered regions, distributions and report (ZIP)',
+                   make_export(w,d,mm,report,regions), file_name='DryMatter_Vision_Results.zip',
                    mime='application/zip', type='primary')
