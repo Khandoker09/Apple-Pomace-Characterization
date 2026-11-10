@@ -2,7 +2,7 @@
 Single-file analysis app; pair with requirements.txt for deployment.
 
 Research caution: numbered regions are candidate 2D image patches, not validated
-physical particles. Vessel-independent material masks need visual review.
+physical particles. Automatic tray and ruler detection still require visual review.
 """
 from __future__ import annotations
 import colorsys
@@ -46,359 +46,182 @@ LINE='#DCE5EC'
 SMALL, MEDIUM, LARGE='#2987EF','#13B89B','#E14D98'
 CLASS_RGB={'Small':(41,135,239),'Medium':(19,184,155),'Large':(225,77,152)}
 
-# Maximum disagreement allowed between the wet and dry ruler calibrations.
-# Both photos should come from the same camera setup, so a larger mismatch
-# means at least one calibration is wrong.
-CALIBRATION_TOLERANCE = .15
 
-
-CALIBRATION_SIDE = 2300   # ruler ticks are read on a larger copy than the one displayed
-
-
-def read_uploaded(data:bytes,max_side:int=1150):
-    """Load an image and calibrate it automatically from the ruler.
-
-    Returns (rgb, mm_per_px, message, ruler_mask). mm_per_px refers to the
-    displayed/analyzed image (longest side max_side). The ruler is read on a
-    larger copy for precision. ruler_mask marks the ruler so it can never be
-    mistaken for sample material (None if no ruler was validated).
-    """
+def read_uploaded(data:bytes,max_side:int=1150)->tuple[np.ndarray,float|None,str]:
     with Image.open(io.BytesIO(data)) as im:
         im=ImageOps.exif_transpose(im).convert('RGB')
-        big=im.copy()
-        big.thumbnail((CALIBRATION_SIDE,CALIBRATION_SIDE),Image.Resampling.LANCZOS)
         im.thumbnail((max_side,max_side),Image.Resampling.LANCZOS)
         rgb=np.asarray(im).copy()
-        rgb_big=np.asarray(big).copy()
-    mm_big,msg,info=auto_ruler(rgb_big)
-    if mm_big is None and rgb_big.shape!=rgb.shape:
-        mm_small,msg_small,info_small=auto_ruler(rgb)
-        if mm_small is not None:
-            return rgb,mm_small,msg_small,ruler_exclusion_mask(rgb.shape[:2],info_small,1.0)
-        return rgb,None,msg,None
-    if mm_big is None:
-        return rgb,None,msg,None
-    # Convert mm/px of the large copy to mm/px of the displayed copy.
-    ratio=0.5*(rgb_big.shape[1]/rgb.shape[1]+rgb_big.shape[0]/rgb.shape[0])
-    mm=mm_big*ratio
-    excl=ruler_exclusion_mask(rgb.shape[:2],info,rgb.shape[1]/rgb_big.shape[1])
-    return rgb,mm,msg+f' (scale on displayed image: {mm:.5f} mm/px)',excl
+    mm,msg=auto_ruler(rgb)
+    return rgb,mm,msg
 
-def _ruler_stripe_candidates(gray: np.ndarray, orientation: str) -> list[tuple]:
-    """Find the 1-mm tick lattice of a metric ruler using autocorrelation.
-
-    The scanner finds repeated fine/medium/long tick lines; it does NOT use
-    handwritten guesses about the ruler's cm-label positions.  Rotating the
-    image before calling this also supports horizontal rulers.
-
-    A true 1-mm lattice also correlates at 2, 3, 4, 5 and 10 mm. After scoring
-    all periods, the smallest period that scores nearly as well as the best one
-    is therefore preferred (octave correction), so the scale is not
-    overestimated by a whole-number factor.
-    """
-    from scipy.ndimage import gaussian_filter1d
-    from scipy.signal import correlate
-
+def detect_ruler_box(gray: np.ndarray) -> tuple[int, int, int, int] | None:
+    """Locate the printed metric ruler body on the right side of the image."""
     h, w = gray.shape
-    if h < 220 or w < 180:
-        return []
-    width = max(7, int(round(w * .014)))
-    stride = max(4, width // 2)
-    # Explore the full image, so the ruler need not appear at the right edge.
-    # Stay away from the very edge, where a photo frame can mimic a stripe.
-    xs = range(max(3, int(w * .035)), max(4, int(w * .965) - width), stride)
-    windows = [(int(.10*h), int(.90*h)), (int(.23*h), int(.80*h))]
-    candidates = []
-    low_q = max(2.7, h * .0035)
-    high_q = min(20., h * .025)
-    if high_q <= low_q:
-        return []
-
-    # A 1-mm tick interval is normally 3-20 pixels for the analyzed image;
-    # checking both the 5-mm and 10-mm repetitions rejects noisy textures.
-    for x in xs:
-        for ya, yb in windows:
-            stripe = gray[ya:yb, x:x+width].mean(axis=1)
-            z = gaussian_filter1d(stripe, 1.) - gaussian_filter1d(stripe, max(9., h*.025))
-            z -= z.mean()
-            if z.std() < 2.0:
-                continue
-            n = z.size
-            max_lag = min(int(h*.21), n//3, int(10*high_q+4))
-            if max_lag < 10*low_q:
-                continue
-            ac = correlate(z, z, mode='full', method='fft')[n-1:n+max_lag].astype(float)
-            squares = np.r_[0., np.cumsum(z*z)]
-            lags = np.arange(1, max_lag+1)
-            left = squares[n-lags]
-            right = squares[n]-squares[lags]
-            ac = ac[1:]/(np.sqrt(np.maximum(left*right, 1e-12)))
-
-            def strength(q: float, count: int) -> float:
-                at = int(round(q*count))-1
-                if at < 2 or at >= len(ac)-2:
-                    return -1.
-                return float(np.max(ac[at-1:at+2]))
-
-            # Score every plausible period first, then pick.
-            scored: dict[float, float] = {}
-            for q in np.arange(low_q, high_q, .10):
-                scores = [strength(q,k) for k in (1, 2, 3, 4, 5, 6, 8, 10)]
-                if scores[4] < .38 or scores[7] < .38:
-                    continue
-                scored[round(float(q), 2)] = (
-                    scores[0]*.10 + scores[1]*.10 + scores[2]*.10 +
-                    scores[3]*.05 + scores[4]*.23 + scores[5]*.07 +
-                    scores[6]*.05 + scores[7]*.30)
-            if not scored:
-                continue
-            q_best, s_best = max(scored.items(), key=lambda kv: kv[1])
-            s_best_val = s_best
-
-            # Octave correction: prefer the finest period that is almost as good.
-            for div in (10, 5, 4, 3, 2):
-                target = q_best / div
-                if target < low_q - .15:
-                    continue
-                near = [(s, q) for q, s in scored.items()
-                        if abs(q - target) <= max(.15, .04*target)]
-                if near and max(near)[0] >= s_best_val - .10:
-                    s_best_val, q_best = max(near)
-                    break
-            if s_best_val >= .66:
-                # Refine the 1-mm period from the 10-mm repetition peak (sub-pixel).
-                lag10 = q_best*10
-                lo_i, hi_i = int(lag10*.97)-1, int(lag10*1.03)
-                if 1 <= lo_i < hi_i < len(ac)-1:
-                    i_pk = lo_i + int(np.argmax(ac[lo_i:hi_i]))
-                    if 1 <= i_pk < len(ac)-1:
-                        y0_, y1_, y2_ = ac[i_pk-1], ac[i_pk], ac[i_pk+1]
-                        den = y0_ - 2*y1_ + y2_
-                        delta = .5*(y0_-y2_)/den if abs(den) > 1e-9 else 0.
-                        q_ref = ((i_pk+1) + float(np.clip(delta,-.5,.5)))/10.
-                        if abs(q_ref-q_best) <= .04*q_best:
-                            q_best = q_ref
-                candidates.append((s_best_val, float(q_best), x, ya, orientation, width))
-    return candidates
-
-
-def auto_ruler(rgb: np.ndarray):
-    """Automatically calibrate from a visible *metric* ruler, if verifiable.
-
-    Works with horizontal or vertical rulers, without user-entered distances.
-    Does not pretend that an unrecognizable ruler is calibrated.
-    Returns (mm_per_px | None, message, ruler_info | None).
-    """
-    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
-    candidates = _ruler_stripe_candidates(gray, 'vertical')
-    candidates += _ruler_stripe_candidates(np.ascontiguousarray(np.rot90(gray)), 'horizontal')
-    if not candidates:
-        return None, 'Could not validate regularly spaced metric ruler ticks; reporting pixels.', None
-
-    # Multiple adjacent scanlines must agree. This blocks a single textured
-    # object accidentally resembling ruler marks.
-    candidates.sort(reverse=True)
-    best = candidates[0]
-    strong = [c for c in candidates if c[0] >= max(.66, best[0]-.13)
-              and abs(c[1]-best[1]) <= max(.4, .075*best[1])
-              and c[4] == best[4] and abs(c[2]-best[2]) <= max(22, int(rgb.shape[1]*.05))]
-    distinct_stripes = len(set(c[2] for c in strong))
-    if distinct_stripes < 2:
-        return None, 'Ruler-like marks found, but adjacent scanlines did not confirm their spacing.', None
-
-    # 1 pixel per tick should correspond to 1 mm, not 1 cm.  Robustly combine
-    # the corroborating stripe estimates rather than a single noisy reading.
-    q = float(np.median([c[1] for c in strong]))
-    mm_per_px = 1.0/q
-    width = strong[0][5]
-    info = {'orientation': best[4],
-            'tick_lo': int(min(c[2] for c in strong)),
-            'tick_hi': int(max(c[2] for c in strong) + width),
-            'width': int(width), 'q': q}
-    return mm_per_px, (f'Metric ruler validated automatically ({best[4]}): '
-                       f'1 mm ≈ {q:.2f} px; 10 mm ≈ {q*10:.1f} px; '
-                       f'{mm_per_px:.5f} mm/px, {distinct_stripes} agreeing scanlines.'), info
-
-
-def ruler_exclusion_mask(shape: tuple[int, int], info: dict | None, scale: float = 1.0):
-    """Boolean mask of the ruler body, so it is never counted as sample.
-
-    The tick edge is known from the validated tick stripes; the ruler body
-    extends from that edge toward the nearer image border. `info` is in the
-    coordinates of the image the ruler was read on; `scale` converts to `shape`.
-    """
-    if not info:
+    gx = np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3))
+    col = cv2.GaussianBlur(gx.mean(axis=0).astype(np.float32)[None, :], (1, 31), 0)[0]
+    start, stop = int(w * 0.65), int(w * 0.98)
+    region = col[start:stop]
+    if region.size < 30:
         return None
-    h, w = shape
-    lo = info['tick_lo']*scale
-    hi = info['tick_hi']*scale
-    half = info['width']*scale*.5
-    mask = np.zeros((h, w), bool)
-    size = w if info['orientation'] == 'vertical' else h
-    if (lo+hi)/2 > size/2:
-        a, b = int(round(lo+half)), size       # body toward the far border
-    else:
-        a, b = 0, int(round(hi-half))
-    a, b = max(0, a), min(size, b)
-    if b <= a:
+    peaks, _ = find_peaks(region, distance=20,
+                          prominence=max(2.0, float(region.std()) * 0.40))
+    if len(peaks) < 2:
         return None
-    if info['orientation'] == 'vertical':
-        mask[:, a:b] = True
+    peaks = peaks + start
+    best, best_score = None, -1e9
+    for i in range(len(peaks)):
+        for j in range(i + 1, len(peaks)):
+            xl, xr = int(peaks[i]), int(peaks[j])
+            width = xr - xl
+            if not 70 <= width <= 220:
+                continue
+            score = float(col[xl] + col[xr]) + 0.004 * (xl + xr)
+            if score > best_score:
+                best_score = score
+                best = (xl, xr)
+    if best is None:
+        return None
+    xl, xr = best
+    left_band = gx[:, max(0, xl - 2):min(w, xl + 3)].mean(axis=1)
+    right_band = gx[:, max(0, xr - 2):min(w, xr + 3)].mean(axis=1)
+    row = cv2.GaussianBlur((left_band + right_band).astype(np.float32)[:, None],
+                           (1, 31), 0)[:, 0]
+    threshold = float(row.mean() + 0.35 * row.std())
+    ys = np.where(row > threshold)[0]
+    if len(ys) < 50:
+        y0, y1 = int(h * 0.10), int(h * 0.95)
     else:
-        mask[a:b, :] = True
-    return mask
+        y0, y1 = int(ys[0]), int(ys[-1])
+    return xl, xr, y0, y1
 
 
-def reconcile_calibrations(wm: float | None, dm: float | None,
-                           wmsg: str, dmsg: str) -> tuple[float | None, float | None, str, str]:
-    """Wet and dry photos should share one camera setup; reject inconsistent scales."""
-    if wm is not None and dm is not None and abs(wm/dm - 1) > CALIBRATION_TOLERANCE:
-        note = (f' REJECTED: wet scale ({wm:.5f} mm/px) and dry scale ({dm:.5f} mm/px) '
-                f'differ by more than {CALIBRATION_TOLERANCE*100:.0f}%. '
-                'Retake the photos from the same distance with the ruler fully visible.')
-        return None, None, wmsg + note, dmsg + note
-    return wm, dm, wmsg, dmsg
+def auto_ruler(rgb: np.ndarray) -> tuple[float | None, str]:
+    """Automatic metric ruler calibration using repeated 1 mm ticks."""
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    box = detect_ruler_box(gray)
+    if box is None:
+        return None, 'No trustworthy ruler body detected; reporting pixels.'
+    xl, xr, y0, y1 = box
+    width = xr - xl
+    xa = max(0, int(xl + 0.03 * width))
+    xb = min(gray.shape[1], int(xl + 0.34 * width))
+    ya = max(0, int(y0 + 0.02 * (y1 - y0)))
+    yb = min(gray.shape[0], int(y1 - 0.02 * (y1 - y0)))
+    sub = gray[ya:yb, xa:xb]
+    if sub.size == 0 or sub.shape[0] < 200:
+        return None, 'Ruler region too small for reliable calibration; reporting pixels.'
+    blackhat = cv2.morphologyEx(
+        sub, cv2.MORPH_BLACKHAT,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+    )
+    weights = np.linspace(1.0, 0.55, blackhat.shape[1], dtype=np.float32)
+    response = (blackhat * weights[None, :]).mean(axis=1)
+    response = cv2.GaussianBlur(response[:, None].astype(np.float32), (1, 7), 0)[:, 0]
+    peaks, _ = find_peaks(
+        response,
+        distance=4,
+        prominence=max(1.2, float(response.std()) * 0.50),
+        height=float(response.mean())
+    )
+    if len(peaks) < 30:
+        return None, 'Too few ruler ticks were detected; reporting pixels.'
+    dd = np.diff(peaks).astype(float)
+    dd = dd[(dd >= 4.5) & (dd <= 16)]
+    if len(dd) < 20:
+        return None, 'Ruler ticks were not regularly spaced; reporting pixels.'
+    step = float(np.median(dd))
+    good = dd[np.abs(dd - step) <= 1.5]
+    regularity = float(len(good) / max(1, len(dd)))
+    if regularity < 0.65:
+        return None, 'Ruler ticks were inconsistent; reporting pixels.'
+    # Average repeated one-millimeter intervals to avoid integer-pixel rounding.
+    step = float(np.mean(good)) if len(good) else step
+    mm = 1.0 / step
+    return mm, f'Ruler recognized: 1 mm ≈ {step:.2f} px ({mm:.4f} mm/px, {len(dd)} intervals).'
+
+def detect_tray_circle(rgb: np.ndarray) -> tuple[int, int, int] | None:
+    """Detect the round tray automatically; tailored to this imaging setup."""
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    blurred = cv2.medianBlur(gray, 5)
+    h, w = gray.shape
+    circles = cv2.HoughCircles(
+        blurred, cv2.HOUGH_GRADIENT, dp=1.2, minDist=min(h, w) // 5,
+        param1=120, param2=35,
+        minRadius=int(min(h, w) * 0.18),
+        maxRadius=int(min(h, w) * 0.44)
+    )
+    if circles is None:
+        return None
+    best, best_score = None, -1e9
+    for x, y, r in np.round(circles[0]).astype(int):
+        if not (w * 0.15 <= x <= w * 0.70):
+            continue
+        if not (h * 0.30 <= y <= h * 0.65):
+            continue
+        score = r - 0.35 * abs(x - w * 0.40) - 0.25 * abs(y - h * 0.50)
+        if score > best_score:
+            best_score = score
+            best = (int(x), int(y), int(r))
+    return best
 
 
-def material_mask(rgb: np.ndarray, bounds: tuple[float, float, float, float] | None = None,
-                  exclude: np.ndarray | None = None):
-    """Estimate a sample silhouette using color seeds + constrained GrabCut.
-
-    The optional bounds are an EXCLUSION crop (left, top, right, bottom,
-    fractions of the image). They are not counted as sample geometry.
-    The final mask follows image pixels, not a preset circle or rectangle.
-    """
+def material_mask(rgb: np.ndarray):
+    """Detect material inside the automatically detected round tray."""
     h, w = rgb.shape[:2]
-    if bounds is None:
-        bounds = (0., 0., 1., 1.)
-    left, top, right, bottom = bounds
-    x0, y0 = int(left*w), int(top*h)
-    x1, y1 = int(right*w), int(bottom*h)
-    if x1-x0 < 90 or y1-y0 < 90:
-        raise ValueError('Input photograph is too small for reliable analysis.')
-    patch = np.ascontiguousarray(rgb[y0:y1, x0:x1])
-    ph, pw = patch.shape[:2]
-    ex = (exclude[y0:y1, x0:x1] if exclude is not None else np.zeros((ph, pw), bool))
-    smooth = cv2.GaussianBlur(patch, (5, 5), 0)
+    tray = detect_tray_circle(rgb)
+    if tray is None:
+        raise ValueError('Could not detect the round tray. Use an overhead photo with the tray fully visible.')
+    cx, cy, r = tray
+    yy, xx = np.ogrid[:h, :w]
+    tray_mask = (xx - cx) ** 2 + (yy - cy) ** 2 <= int((r * 0.965) ** 2)
+
+    smooth = cv2.GaussianBlur(rgb, (3, 3), 0.65)
     hsv = cv2.cvtColor(smooth, cv2.COLOR_RGB2HSV)
     hue, sat, val = cv2.split(hsv)
-    lab = cv2.cvtColor(smooth, cv2.COLOR_RGB2LAB)
-    # High-chroma, darker material is a more trustworthy SEED than every
-    # 'warm' pixel: paper, beige worktops and wood can also be warm.
-    warm = (((hue < 44) | (hue > 168)) & (sat >= 60) & (val >= 30))
-    seed = (warm & ((sat >= 88) | (val < 145)) & ~ex).astype(np.uint8)
-    k = max(3, int(round(min(ph, pw)*.012)) | 1)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(k,k))
-    seed = cv2.morphologyEx(seed, cv2.MORPH_CLOSE, kernel)
-    count, cc, stats, centers = cv2.connectedComponentsWithStats(seed, 8)
-    if count <= 1:
-        raise ValueError('No strongly colored material seed was found. Retake the photograph with neutral surroundings.')
-    candidates=[]
-    for label in range(1, count):
-        area=int(stats[label, cv2.CC_STAT_AREA])
-        if area < max(100, int(ph*pw*.002)):
-            continue
-        x, y, cw, ch = stats[label, :4]
-        touches = x < 3 or y < 3 or x+cw >= pw-3 or y+ch >= ph-3
-        cx,cy=centers[label]
-        distance=((cx-pw/2)/(pw/2))**2+((cy-ph/2)/(ph/2))**2
-        score = area * (0.12 if touches else 1.) / (1 + .65*distance)
-        candidates.append((score,label))
-    if not candidates:
-        raise ValueError('No sufficiently large material component; Use a neutral background and even lighting.')
-    _, chosen=max(candidates)
-    core=(cc==chosen).astype(np.uint8)
-    # Fill gaps in the strong-color seed so dark/bright fragments are kept.
-    core=cv2.morphologyEx(core, cv2.MORPH_CLOSE, kernel)
-    contours,_=cv2.findContours(core,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
-    sure=np.zeros((ph,pw),np.uint8)
-    cv2.drawContours(sure,[max(contours,key=cv2.contourArea)],-1,1,-1)
-    # GrabCut learns BOTH the sample's colors and the surrounding worktop.
-    # Force a border background; a crop that cuts through the sample must be
-    # expanded by the user rather than inventing pixels outside the photo.
-    grow=max(7,int(min(ph,pw)*.035))
-    dilation=cv2.dilate(sure,cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(grow|1,grow|1)))
-    gc=np.full((ph,pw),cv2.GC_PR_BGD,np.uint8)
-    gc[dilation>0]=cv2.GC_PR_FGD
-    erode_size=max(3,int(min(ph,pw)*.012)|1)
-    inner=cv2.erode(sure,cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(erode_size,erode_size)))
-    gc[inner>0]=cv2.GC_FGD
-    gc[ex]=cv2.GC_BGD   # the ruler is never sample material
-    margin=2            # keep the frame margin tiny: a dish may touch the photo edge
-    gc[:margin,:]=cv2.GC_BGD;gc[-margin:,:]=cv2.GC_BGD
-    gc[:,:margin]=cv2.GC_BGD;gc[:,-margin:]=cv2.GC_BGD
-    if not np.any(gc==cv2.GC_FGD):
-        raise ValueError('No reliable foreground seed was found automatically.')
-    bg_model=np.zeros((1,65),np.float64); fg_model=np.zeros((1,65),np.float64)
-    try:
-        cv2.grabCut(cv2.cvtColor(patch,cv2.COLOR_RGB2BGR),gc,None,
-                    bg_model,fg_model,5,cv2.GC_INIT_WITH_MASK)
-        selected=np.isin(gc,(cv2.GC_FGD,cv2.GC_PR_FGD)).astype(np.uint8)
-    except cv2.error:
-        selected=sure.copy()  # Conservative fallback, never include whole worktop.
-    # Keep only the component connected to the original sample seed.
-    selected=cv2.morphologyEx(selected,cv2.MORPH_CLOSE,kernel)
-    n, labels, stat, _=cv2.connectedComponentsWithStats(selected,8)
-    ranked=[(int(np.count_nonzero((labels==i)&(sure>0))),i)
-            for i in range(1,n) if stat[i,cv2.CC_STAT_AREA]>100]
-    if not ranked or max(ranked)[0] == 0:
-        raise ValueError('Automatic foreground separation failed; try a clearer overhead photo.')
-    selected=(labels==max(ranked)[1]).astype(np.uint8)
-    contours,_=cv2.findContours(selected,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
-    silhouette=np.zeros((ph,pw),np.uint8)
-    cv2.drawContours(silhouette,[max(contours,key=cv2.contourArea)],-1,1,-1)
-    # A small erosion of the edge reduces contamination by tray walls.
-    trim=max(3,int(round(min(ph,pw)*.006))|1)
-    silhouette=cv2.morphologyEx(silhouette,cv2.MORPH_OPEN,
-                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(trim,trim)))
-    # Reject neutral/white reflections but retain brown/dark material.
-    foreground=(silhouette>0)&(sat>=35)&(val>=25)&~ex
-    if foreground.sum() < max(200,ph*pw*.005):
-        raise ValueError('Too few material pixels detected automatically; check illumination and background.')
+    red_minus_blue = smooth[:, :, 0].astype(np.int16) - smooth[:, :, 2].astype(np.int16)
 
-    # Build the footprint from the CLEANED material mask, not the raw GrabCut
-    # silhouette. The raw silhouette can leak onto a neighbouring ruler or tray
-    # wall, which would inflate footprint area and footprint reduction.
-    close_k = max(9, int(min(ph, pw)*.06) | 1)
-    fp = cv2.morphologyEx(foreground.astype(np.uint8), cv2.MORPH_CLOSE,
-                          cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k, close_k)))
-    fp = ndi.binary_fill_holes(fp).astype(np.uint8)
-    # An opening cuts thin bridges to attached objects such as a ruler edge.
-    open_k = max(7, int(min(ph, pw)*.03) | 1)
-    fp_open = cv2.morphologyEx(fp, cv2.MORPH_OPEN,
-                               cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_k, open_k)))
-    if fp_open.sum() > 0:
-        fp = fp_open
-    n_fp, lab_fp, st_fp, _ = cv2.connectedComponentsWithStats(fp, 8)
-    if n_fp > 1:
-        fp = (lab_fp == 1 + int(np.argmax(st_fp[1:, cv2.CC_STAT_AREA]))).astype(np.uint8)
-    if fp.sum() < max(200, ph*pw*.005):
-        fp = silhouette.copy()  # safety fallback
-    silhouette = fp
-    # Material pixels must also lie within the cleaned footprint.
-    foreground = foreground & (silhouette > 0)
+    chromatic = (tray_mask & (sat >= 28) & (val >= 22) &
+                 (((hue <= 48) | (hue >= 168))) & (red_minus_blue > 4))
+    if int(chromatic.sum()) < max(250, int(tray_mask.sum() * 0.03)):
+        raise ValueError('Could not locate enough colored material inside the tray.')
 
-    mask=np.zeros((h,w),bool); footprint=np.zeros((h,w),bool)
-    mask[y0:y1,x0:x1]=foreground
-    footprint[y0:y1,x0:x1]=silhouette>0
-    # Only a substantial contact with the photo edge suggests a cropped sample;
-    # a dish rim merely grazing the edge is not a problem.
-    fgm = foreground.astype(np.uint8)
-    touches_frame = bool(fgm[0].mean() > .08 or fgm[-1].mean() > .08 or
-                         fgm[:,0].mean() > .08 or fgm[:,-1].mean() > .08)
-    coverage = float(mask.mean())
-    uncertain = touches_frame or coverage > .65 or coverage < .015
-    info={'kind':'image-derived irregular silhouette',
-          'quality_flag': 'Review recommended' if uncertain else 'Automatic estimate',
-          'quality_reasons': ('touches frame / implausible sample coverage' if uncertain else 'No gross geometry warning'),
-          'method':'strong-color seed + foreground/background GrabCut + connected component',
-          'foreground_pixels':int(mask.sum()),
-          'footprint_pixels':int(footprint.sum()),
-          'mask_fraction_pct':round(100*mask.mean(),2),
-          'automatic_roi':True,
-          'limitation':'Heuristic segmentation; inspect green material and pink boundary before interpreting results.'}
-    return mask,footprint,info
-
+    ksize = max(9, int(round(min(h, w) * 0.012)) | 1)
+    closed = cv2.morphologyEx(
+        np.uint8(chromatic) * 255, cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+    )
+    n, objects, stats, _ = cv2.connectedComponentsWithStats(closed, 8)
+    if n < 2:
+        silhouette = np.uint8(tray_mask)
+    else:
+        main = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        seed = np.uint8(objects == main)
+        contours, _ = cv2.findContours(seed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        silhouette = np.zeros((h, w), np.uint8)
+        cv2.drawContours(silhouette, [max(contours, key=cv2.contourArea)], -1, 255, -1)
+    halo = max(5, int(round(min(h, w) * 0.010)) | 1)
+    nearby = cv2.dilate(
+        silhouette,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (halo, halo))
+    ) > 0
+    foreground = chromatic & nearby & tray_mask
+    foreground = cv2.morphologyEx(
+        np.uint8(foreground) * 255, cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+    ) > 0
+    raw_count = int(foreground.sum())
+    if raw_count < 200:
+        raise ValueError('Too few material pixels remain inside the tray after segmentation.')
+    mask_info = {
+        'kind': 'tray-guided material mask',
+        'method': 'automatic round-tray detection + warm-color material mask',
+        'foreground_pixels': raw_count,
+        'footprint_pixels': int((silhouette > 0).sum()),
+        'mask_fraction_pct': round(raw_count * 100 / max(1, int(tray_mask.sum())), 2),
+        'limitation': 'Automatic detection assumes the sample sits inside a clearly visible round tray.'
+    }
+    return foreground, (silhouette > 0), mask_info
 
 def material_overlay(result: dict) -> np.ndarray:
     """QC view: GREEN = accepted material, MAGENTA = detected material edge."""
@@ -412,8 +235,8 @@ def material_overlay(result: dict) -> np.ndarray:
     return rgb
 
 
-def detect_regions(rgb: np.ndarray, mm: float|None, bounds=None, exclude=None) -> dict:
-    fg,roi,info=material_mask(rgb,bounds,exclude)
+def detect_regions(rgb: np.ndarray, mm: float|None) -> dict:
+    fg,roi,info=material_mask(rgb)
     if fg.sum()<300:
         raise ValueError('The colored sample was not identified. Use a clear overhead photo in a contrasting tray.')
     hsv=cv2.cvtColor(rgb,cv2.COLOR_RGB2HSV)
@@ -484,19 +307,45 @@ def detect_regions(rgb: np.ndarray, mm: float|None, bounds=None, exclude=None) -
             'L_sample':L[fg][::max(1,int(fg.sum()//13000))]}
 
 
+def apply_mm_scale(result: dict, mm_per_px: float) -> None:
+    """Apply or refresh physical scaling from stored pixel measurements."""
+    for p in result['features']:
+        p['area'] = p['area_px2'] * mm_per_px ** 2
+        p['length'] = p['length_px'] * mm_per_px
+        p['width'] = p['width_px'] * mm_per_px
+        p['eq_diameter'] = p['eq_diameter_px'] * mm_per_px
+        p['local_width'] = (p['local_width'] / max(result.get('mm_per_px') or 1.0, 1e-12)
+                            if result['unit'] == 'mm' and result.get('mm_per_px') else p['local_width'])
+        p['local_width'] = p['local_width'] * mm_per_px
+        p['perimeter'] = (p['perimeter'] / max(result.get('mm_per_px') or 1.0, 1e-12)
+                          if result['unit'] == 'mm' and result.get('mm_per_px') else p['perimeter'])
+        p['perimeter'] = p['perimeter'] * mm_per_px
+    result['colored_area'] = float(result['mask'].sum()) * mm_per_px ** 2
+    result['footprint_area'] = float(result['roi'].sum()) * mm_per_px ** 2
+    result['mm_per_px'] = mm_per_px
+    result['unit'] = 'mm'
+    result['area_unit'] = 'mm²'
+
+
 def assign_classes(wet: dict,dry: dict)->tuple[float,float]:
-    # Comparable physical units require both rulers. Otherwise both analyses
-    # are expressed in image pixels; source resize is identical for same views.
-    if not(wet['mm_per_px'] is not None and dry['mm_per_px'] is not None):
-        for r in (wet,dry):
-            if r['mm_per_px'] is not None:
-                fac=r['mm_per_px']
-                for p in r['features']:
-                    for key in ('length','width','eq_diameter','local_width','perimeter'):p[key]/=fac
-                    p['area']/=fac**2
-                r['colored_area']/=fac**2
-                r['footprint_area']/=fac**2
-            r['mm_per_px']=None;r['unit']='px';r['area_unit']='px²'
+    """Classify visible candidate regions and harmonize pair calibration."""
+    same_shape = wet['rgb'].shape[:2] == dry['rgb'].shape[:2]
+    # If one image calibrates and the other does not, reuse the pair scale when both
+    # photos were captured at the same size. This matches the intended imaging setup.
+    if wet['mm_per_px'] is None and dry['mm_per_px'] is not None and same_shape:
+        apply_mm_scale(wet, dry['mm_per_px'])
+    elif dry['mm_per_px'] is None and wet['mm_per_px'] is not None and same_shape:
+        apply_mm_scale(dry, wet['mm_per_px'])
+    elif wet['mm_per_px'] is not None and dry['mm_per_px'] is not None:
+        rel = abs(wet['mm_per_px'] - dry['mm_per_px']) / max(wet['mm_per_px'], dry['mm_per_px'])
+        if rel <= 0.08:
+            shared = float((wet['mm_per_px'] + dry['mm_per_px']) / 2.0)
+            apply_mm_scale(wet, shared)
+            apply_mm_scale(dry, shared)
+        else:
+            # Different ruler scales may mean the images were taken at different
+            # camera distances. Preserve independent calibration; do not average.
+            pass
     values=[p['eq_diameter'] for r in (wet,dry) for p in r['features']]
     if len(values)>=3:
         cuts=tuple(map(float,np.percentile(values,[33.33,66.67])))
@@ -506,7 +355,6 @@ def assign_classes(wet: dict,dry: dict)->tuple[float,float]:
             d=p['eq_diameter']
             p['class']='Small' if d<cuts[0] else ('Medium' if d<cuts[1] else 'Large')
     return cuts
-
 
 def region_color(i: int) -> tuple[int,int,int]:
     # Golden-angle hue progression gives a variety of distinguishable hues.
@@ -523,7 +371,7 @@ def segmentation_overlay(result:dict,mode='rainbow',numbers=True)->np.ndarray:
     lut=np.zeros((int(lab.max())+1,3),np.uint8)
     class_by_id={p['id']:p['class'] for p in result['features']}
     for i in range(1,len(lut)):
-        lut[i]=region_color(i) if mode=='rainbow' else CLASS_RGB.get(class_by_id.get(i, 'Unclassified'), (140,140,140))
+        lut[i]=region_color(i) if mode=='rainbow' else CLASS_RGB.get(class_by_id[i], (140,140,140))
     painted=lut[lab]
     src[active]=np.clip(.24*src[active].astype(float)+.76*painted[active],0,255).astype(np.uint8)
     # Only draw boundaries inside foreground. We never outline the metal rim.
@@ -560,8 +408,8 @@ def new_figure(title:str,subtitle:str='')->Figure:
 def make_figures(wet:dict,dry:dict,cuts:tuple[float,float])->dict[str,Figure]:
     paired=[(wet,'WET / BEFORE',TEAL),(dry,'DRY / AFTER',ORANGE)]
     figs={}
-    f=new_figure('Material detection — shape independent',
-        'GREEN = detected pomace pixels; PINK = observed material boundary. No circle or rectangle is imposed. Review before interpreting measurements.')
+    f=new_figure('Material detection — automatic tray detection',
+        'GREEN = detected pomace pixels; PINK = automatically detected tray/sample boundary used for analysis. Review before interpreting measurements.')
     gs=f.add_gridspec(1,2,left=.024,right=.977,bottom=.057,top=.854,wspace=.040)
     for i,(r,t,c) in enumerate(paired):
         a=f.add_subplot(gs[0,i]);a.imshow(material_overlay(r));a.axis('off')
@@ -724,20 +572,18 @@ with st.sidebar:
     st.header('Analyze samples')
     wet_file=st.file_uploader('Wet / Before',type=['png','jpg','jpeg','webp','tif','tiff'],key='wet')
     dry_file=st.file_uploader('Dry / After',type=['png','jpg','jpeg','webp','tif','tiff'],key='dry')
-    analyze=st.button('Analyze images',type='primary',width="stretch",disabled=wet_file is None or dry_file is None)
-    st.caption('Automatic processing: sample detection and ruler reading. For comparable measurements, use straight overhead photos, even lighting and a visible ruler in both images.')
+    analyze=st.button('Analyze images',type='primary',use_container_width=True,disabled=wet_file is None or dry_file is None)
+    st.caption('For the best comparison: same camera height, straight overhead view, consistent lighting, ruler in both images.')
     st.divider()
     st.markdown('<div class="dry-credit">'+CREDIT+'</div>',unsafe_allow_html=True)
 
 if analyze:
     try:
         with st.spinner('Finding material, calibrating rulers, and segmenting visible regions…'):
-            wr,wm,wmsg,wx=read_uploaded(wet_file.getvalue())
-            dr,dm,dmsg,dx=read_uploaded(dry_file.getvalue())
-            # Wet and dry share one camera setup, so inconsistent scales are rejected.
-            wm,dm,wmsg,dmsg=reconcile_calibrations(wm,dm,wmsg,dmsg)
-            wet=detect_regions(wr,wm,exclude=wx)
-            dry=detect_regions(dr,dm,exclude=dx)
+            wr,wm,wmsg=read_uploaded(wet_file.getvalue())
+            dr,dm,dmsg=read_uploaded(dry_file.getvalue())
+            wet=detect_regions(wr,wm)
+            dry=detect_regions(dr,dm)
             cuts=assign_classes(wet,dry)
             figs=make_figures(wet,dry,cuts)
             df=table_rows(wet,dry)
@@ -752,11 +598,11 @@ if 'analysis' not in st.session_state:
     left,right=st.columns(2)
     with left:
         st.subheader('Wet / Before')
-        if wet_file: st.image(wet_file, width="stretch")
+        if wet_file: st.image(wet_file, use_container_width=True)
         else: st.info('Upload the wet image using the sidebar.')
     with right:
         st.subheader('Dry / After')
-        if dry_file:st.image(dry_file,width="stretch")
+        if dry_file:st.image(dry_file,use_container_width=True)
         else:st.info('Upload the dry image using the sidebar.')
     st.info('Upload both photographs and select **Analyze images** to see the measurements and visualizations.')
     st.stop()
@@ -772,52 +618,49 @@ c2.metric('Dry candidate regions',len(dry['features']))
 c3.metric('Mean color difference ΔE*76',f'{np.linalg.norm(wet["mean_lab"]-dry["mean_lab"]):.2f}')
 c4.metric('2D area reduction', (f"{change_metrics(wet,dry)['apparent_colored_area_reduction_pct']:+.1f}%" if change_metrics(wet,dry)['comparable'] else 'Not calibrated'),help='Apparent change in segmented colored pixels after mm calibration—not true shrinkage.')
 if wet['unit']!='mm':
-    st.warning('Calibration was not validated in BOTH images. Measurements are in pixels. '+res['wet_msg']+' '+res['dry_msg'])
+    st.warning('Automatic ruler calibration was not validated in BOTH images. Measurements are in pixels. '+res['wet_msg']+' '+res['dry_msg'])
 else:
     st.caption('Wet: '+res['wet_msg']+'   |   Dry: '+res['dry_msg'])
-st.markdown('<div class="info-box">Contours are <b>candidate 2D image regions</b>, not verified separate physical particles. Review the material mask before using counts or areas. Projected-area changes do not measure true volume shrinkage.</div>',unsafe_allow_html=True)
+st.markdown('<div class="info-box">Contours are <b>candidate 2D image regions</b>, not verified separate physical particles. The mask is generated automatically inside the detected tray; review it before using counts or areas. Projected-area changes do not measure true volume shrinkage.</div>',unsafe_allow_html=True)
 
 tabs=st.tabs(['Material mask','All fragments','Size classes','Measurements','Shrinkage comparison','Color change','Particle table'])
 with tabs[0]:
     st.subheader('Material mask — quality check')
-    for label, result in [('Wet',wet),('Dry',dry)]:
-        if result['roi_info']['quality_flag'] != 'Automatic estimate':
-            st.warning(f'{label} image: automatic sample boundary may be unreliable. ' + result['roi_info']['quality_reasons'])
-    st.caption('Green shows detected pomace; magenta marks its irregular boundary. No circular or rectangular mask is imposed.')
+    st.caption('Green shows detected pomace; magenta marks the automatically detected tray/sample boundary used for analysis.')
     col1,col2=st.columns(2)
     with col1:
         st.markdown('**WET / BEFORE**')
-        st.image(material_overlay(wet),width="stretch")
+        st.image(material_overlay(wet),use_container_width=True)
     with col2:
         st.markdown('**DRY / AFTER**')
-        st.image(material_overlay(dry),width="stretch")
+        st.image(material_overlay(dry),use_container_width=True)
 with tabs[1]:
     st.subheader('Every detected candidate region — unique colors and IDs')
     c1,c2=st.columns(2)
     with c1:
         st.markdown(f'**Wet — {len(wet["features"])} regions**')
-        st.image(segmentation_overlay(wet,'rainbow'),width="stretch")
+        st.image(segmentation_overlay(wet,'rainbow'),use_container_width=True)
     with c2:
         st.markdown(f'**Dry — {len(dry["features"])} regions**')
-        st.image(segmentation_overlay(dry,'rainbow'),width="stretch")
+        st.image(segmentation_overlay(dry,'rainbow'),use_container_width=True)
     st.caption('Numbers match the particle table. Zoom by opening the downloaded PNG at full resolution.')
 with tabs[2]:
     st.subheader('Size classes — comparable thresholds across the pair')
     st.caption(f'Small: < {cuts[0]:.2f} {wet["unit"]}  ·  Medium: {cuts[0]:.2f}–{cuts[1]:.2f}  ·  Large: ≥ {cuts[1]:.2f} {wet["unit"]}')
     st.markdown('🔵 Small　 🟢 Medium　 🩷 Large')
     c1,c2=st.columns(2)
-    with c1:st.image(segmentation_overlay(wet,'class'),width="stretch")
-    with c2:st.image(segmentation_overlay(dry,'class'),width="stretch")
+    with c1:st.image(segmentation_overlay(wet,'class'),use_container_width=True)
+    with c2:st.image(segmentation_overlay(dry,'class'),use_container_width=True)
     counts=pd.DataFrame({'Size':['Small','Medium','Large'],
       'Wet':[sum(p['class']==s for p in wet['features']) for s in ['Small','Medium','Large']],
       'Dry':[sum(p['class']==s for p in dry['features']) for s in ['Small','Medium','Large']]})
     st.markdown('**Size-class counts (same thresholds for wet and dry)**')
     counts['Wet share (%)']=(100*counts['Wet']/max(1,counts['Wet'].sum())).round(1)
     counts['Dry share (%)']=(100*counts['Dry']/max(1,counts['Dry'].sum())).round(1)
-    st.dataframe(counts,hide_index=True,width="stretch")
+    st.dataframe(counts,hide_index=True,use_container_width=True)
 with tabs[3]:
     st.subheader('Two-dimensional size and shape distribution')
-    st.pyplot(make_figures(wet,dry,cuts)['Measurements'],width="stretch")
+    st.pyplot(make_figures(wet,dry,cuts)['Measurements'],use_container_width=True)
     a,b=st.columns(2)
     for col,r,name in [(a,wet,'Wet'),(b,dry,'Dry')]:
         with col:
@@ -845,17 +688,17 @@ with tabs[4]:
             {'Metric':'Sample footprint','Wet':wet['footprint_area'],'Dry':dry['footprint_area'],'Unit':wet['area_unit']},
             {'Metric':'Median region equivalent diameter','Wet':change['wet_median_diameter'],'Dry':change['dry_median_diameter'],'Unit':wet['unit']},
             {'Metric':'Median candidate region area','Wet':change['wet_median_area'],'Dry':change['dry_median_area'],'Unit':wet['area_unit']}
-        ]),hide_index=True,width="stretch")
+        ]),hide_index=True,use_container_width=True)
     st.warning('**These are apparent 2D changes, not experimentally verified shrinkage.** Real volume shrinkage requires wet/dry thickness or 3D depth; true particle shrinkage requires matching the same physical fragments between images.')
 with tabs[5]:
     st.subheader('Color and browning indicators')
-    st.pyplot(make_figures(wet,dry,cuts)['Color change'],width="stretch")
+    st.pyplot(make_figures(wet,dry,cuts)['Color change'],use_container_width=True)
     st.markdown('**What L*, a*, and b* mean**')
     st.markdown('**L*** = lightness (0 is black; 100 is white). **a*** = green (negative) to red (positive). **b*** = blue (negative) to yellow (positive). **ΔE*76** measures distance between two average colors in this three-dimensional color space; **it is not a percentage**. A value such as **7.08** means **7.08 CIELAB units**, not 7.08% change.')
     st.caption('These are approximate camera-based color values. Control lighting, exposure, and white balance for scientific comparisons.')
 with tabs[6]:
     st.subheader('Candidate particle measurements')
-    st.dataframe(df,width="stretch",height=520,hide_index=True)
+    st.dataframe(df,use_container_width=True,height=520,hide_index=True)
     st.download_button('Download measurements CSV',data=df.to_csv(index=False).encode('utf-8-sig'),file_name='drymatter_candidate_regions.csv',mime='text/csv')
 
 st.divider()
