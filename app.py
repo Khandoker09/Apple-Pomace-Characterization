@@ -102,7 +102,7 @@ def material_mask(rgb: np.ndarray, bounds: tuple[float, float, float, float] | N
     x0, y0 = int(left*w), int(top*h)
     x1, y1 = int(right*w), int(bottom*h)
     if x1-x0 < 90 or y1-y0 < 90:
-        raise ValueError('Sample crop is too small; enlarge its bounds.')
+        raise ValueError('Input photograph is too small for reliable analysis.')
     patch = np.ascontiguousarray(rgb[y0:y1, x0:x1])
     ph, pw = patch.shape[:2]
     smooth = cv2.GaussianBlur(patch, (5, 5), 0)
@@ -118,7 +118,7 @@ def material_mask(rgb: np.ndarray, bounds: tuple[float, float, float, float] | N
     seed = cv2.morphologyEx(seed, cv2.MORPH_CLOSE, kernel)
     count, cc, stats, centers = cv2.connectedComponentsWithStats(seed, 8)
     if count <= 1:
-        raise ValueError('No strongly colored material seed was found. Try tighter sample crop bounds.')
+        raise ValueError('No strongly colored material seed was found. Retake the photograph with neutral surroundings.')
     candidates=[]
     for label in range(1, count):
         area=int(stats[label, cv2.CC_STAT_AREA])
@@ -131,7 +131,7 @@ def material_mask(rgb: np.ndarray, bounds: tuple[float, float, float, float] | N
         score = area * (0.12 if touches else 1.) / (1 + .65*distance)
         candidates.append((score,label))
     if not candidates:
-        raise ValueError('No sufficiently large material component; tighten the crop to the sample.')
+        raise ValueError('No sufficiently large material component; Use a neutral background and even lighting.')
     _, chosen=max(candidates)
     core=(cc==chosen).astype(np.uint8)
     # Fill gaps in the strong-color seed so dark/bright fragments are kept.
@@ -153,7 +153,7 @@ def material_mask(rgb: np.ndarray, bounds: tuple[float, float, float, float] | N
     gc[:margin,:]=cv2.GC_BGD;gc[-margin:,:]=cv2.GC_BGD
     gc[:,:margin]=cv2.GC_BGD;gc[:,-margin:]=cv2.GC_BGD
     if not np.any(gc==cv2.GC_FGD):
-        raise ValueError('Sample crop leaves no reliable foreground seed.')
+        raise ValueError('No reliable foreground seed was found automatically.')
     bg_model=np.zeros((1,65),np.float64); fg_model=np.zeros((1,65),np.float64)
     try:
         cv2.grabCut(cv2.cvtColor(patch,cv2.COLOR_RGB2BGR),gc,None,
@@ -167,7 +167,7 @@ def material_mask(rgb: np.ndarray, bounds: tuple[float, float, float, float] | N
     ranked=[(int(np.count_nonzero((labels==i)&(sure>0))),i)
             for i in range(1,n) if stat[i,cv2.CC_STAT_AREA]>100]
     if not ranked or max(ranked)[0] == 0:
-        raise ValueError('Foreground separation failed; try a tighter crop or a clearer photo.')
+        raise ValueError('Automatic foreground separation failed; try a clearer overhead photo.')
     selected=(labels==max(ranked)[1]).astype(np.uint8)
     contours,_=cv2.findContours(selected,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
     silhouette=np.zeros((ph,pw),np.uint8)
@@ -179,16 +179,22 @@ def material_mask(rgb: np.ndarray, bounds: tuple[float, float, float, float] | N
     # Reject neutral/white reflections but retain brown/dark material.
     foreground=(silhouette>0)&(sat>=35)&(val>=25)
     if foreground.sum() < max(200,ph*pw*.005):
-        raise ValueError('Too few material pixels. Check the green mask or adjust the crop.')
+        raise ValueError('Too few material pixels detected automatically; check illumination and background.')
     mask=np.zeros((h,w),bool); footprint=np.zeros((h,w),bool)
     mask[y0:y1,x0:x1]=foreground
     footprint[y0:y1,x0:x1]=silhouette>0
+    touches_frame = bool(np.any(silhouette[0]) or np.any(silhouette[-1]) or
+                         np.any(silhouette[:,0]) or np.any(silhouette[:,-1]))
+    coverage = float(mask.mean())
+    uncertain = touches_frame or coverage > .65 or coverage < .015
     info={'kind':'image-derived irregular silhouette',
+          'quality_flag': 'Review recommended' if uncertain else 'Automatic estimate',
+          'quality_reasons': ('touches frame / implausible sample coverage' if uncertain else 'No gross geometry warning'),
           'method':'strong-color seed + foreground/background GrabCut + connected component',
           'foreground_pixels':int(mask.sum()),
           'footprint_pixels':int(footprint.sum()),
           'mask_fraction_pct':round(100*mask.mean(),2),
-          'crop_bounds':list(bounds),
+          'automatic_roi':True,
           'limitation':'Heuristic segmentation; inspect green material and pink boundary before interpreting results.'}
     return mask,footprint,info
 
@@ -517,18 +523,8 @@ with st.sidebar:
     st.header('Analyze samples')
     wet_file=st.file_uploader('Wet / Before',type=['png','jpg','jpeg','webp','tif','tiff'],key='wet')
     dry_file=st.file_uploader('Dry / After',type=['png','jpg','jpeg','webp','tif','tiff'],key='dry')
-    with st.expander('Improve detection: sample crop (optional)'):
-        st.caption('Percentages of the original image. Exclude ruler and surrounding table; keep the entire sample and a thin background border. These bounds do not set the detected shape.')
-        wet_x=st.slider('Wet horizontal bounds (%)',0,100,(0,100),key='wet_x')
-        wet_y=st.slider('Wet vertical bounds (%)',0,100,(0,100),key='wet_y')
-        dry_x=st.slider('Dry horizontal bounds (%)',0,100,(0,100),key='dry_x')
-        dry_y=st.slider('Dry vertical bounds (%)',0,100,(0,100),key='dry_y')
-    with st.expander('Manual ruler calibration (optional)'):
-        st.caption('Enter measured pixels between TWO marks exactly 10 mm apart in each original uploaded photo. Zero means use automatic ruler detection. Enter the pixel distance as measured in the ORIGINAL photo. The app handles resizing automatically.')
-        wet_ten_mm=st.number_input('Wet: pixels per 10 mm (0 = auto)',min_value=0.0,value=0.0,step=1.0)
-        dry_ten_mm=st.number_input('Dry: pixels per 10 mm (0 = auto)',min_value=0.0,value=0.0,step=1.0)
-    analyze=st.button('Analyze images',type='primary',use_container_width=True,disabled=wet_file is None or dry_file is None)
-    st.caption('For the best comparison: same camera height, straight overhead view, consistent lighting, ruler in both images.')
+    analyze=st.button('Analyze images',type='primary',width="stretch",disabled=wet_file is None or dry_file is None)
+    st.caption('Automatic processing: sample detection and ruler reading. For comparable measurements, use straight overhead photos, even lighting and a visible ruler in both images.')
     st.divider()
     st.markdown('<div class="dry-credit">'+CREDIT+'</div>',unsafe_allow_html=True)
 
@@ -537,22 +533,9 @@ if analyze:
         with st.spinner('Finding material, calibrating rulers, and segmenting visible regions…'):
             wr,wm,wmsg=read_uploaded(wet_file.getvalue())
             dr,dm,dmsg=read_uploaded(dry_file.getvalue())
-            if wet_ten_mm > 0:
-                original=Image.open(io.BytesIO(wet_file.getvalue()))
-                original=ImageOps.exif_transpose(original)
-                scale=wr.shape[1]/original.width
-                wm=10.0/(wet_ten_mm*scale)
-                wmsg=f'Manual calibration: {wet_ten_mm*scale:.1f} resized pixels / 10 mm.'
-            if dry_ten_mm > 0:
-                original=Image.open(io.BytesIO(dry_file.getvalue()))
-                original=ImageOps.exif_transpose(original)
-                scale=dr.shape[1]/original.width
-                dm=10.0/(dry_ten_mm*scale)
-                dmsg=f'Manual calibration: {dry_ten_mm*scale:.1f} resized pixels / 10 mm.'
-            wb=(wet_x[0]/100,wet_y[0]/100,wet_x[1]/100,wet_y[1]/100)
-            db=(dry_x[0]/100,dry_y[0]/100,dry_x[1]/100,dry_y[1]/100)
-            wet=detect_regions(wr,wm,wb)
-            dry=detect_regions(dr,dm,db)
+            # Fully automatic: material selection and scale detection use image evidence only.
+            wet=detect_regions(wr,wm)
+            dry=detect_regions(dr,dm)
             cuts=assign_classes(wet,dry)
             figs=make_figures(wet,dry,cuts)
             df=table_rows(wet,dry)
@@ -567,11 +550,11 @@ if 'analysis' not in st.session_state:
     left,right=st.columns(2)
     with left:
         st.subheader('Wet / Before')
-        if wet_file: st.image(wet_file, use_container_width=True)
+        if wet_file: st.image(wet_file, width="stretch")
         else: st.info('Upload the wet image using the sidebar.')
     with right:
         st.subheader('Dry / After')
-        if dry_file:st.image(dry_file,use_container_width=True)
+        if dry_file:st.image(dry_file,width="stretch")
         else:st.info('Upload the dry image using the sidebar.')
     st.info('Upload both photographs and select **Analyze images** to see the measurements and visualizations.')
     st.stop()
@@ -595,41 +578,44 @@ st.markdown('<div class="info-box">Contours are <b>candidate 2D image regions</b
 tabs=st.tabs(['Material mask','All fragments','Size classes','Measurements','Shrinkage comparison','Color change','Particle table'])
 with tabs[0]:
     st.subheader('Material mask — quality check')
+    for label, result in [('Wet',wet),('Dry',dry)]:
+        if result['roi_info']['quality_flag'] != 'Automatic estimate':
+            st.warning(f'{label} image: automatic sample boundary may be unreliable. ' + result['roi_info']['quality_reasons'])
     st.caption('Green shows detected pomace; magenta marks its irregular boundary. No circular or rectangular mask is imposed.')
     col1,col2=st.columns(2)
     with col1:
         st.markdown('**WET / BEFORE**')
-        st.image(material_overlay(wet),use_container_width=True)
+        st.image(material_overlay(wet),width="stretch")
     with col2:
         st.markdown('**DRY / AFTER**')
-        st.image(material_overlay(dry),use_container_width=True)
+        st.image(material_overlay(dry),width="stretch")
 with tabs[1]:
     st.subheader('Every detected candidate region — unique colors and IDs')
     c1,c2=st.columns(2)
     with c1:
         st.markdown(f'**Wet — {len(wet["features"])} regions**')
-        st.image(segmentation_overlay(wet,'rainbow'),use_container_width=True)
+        st.image(segmentation_overlay(wet,'rainbow'),width="stretch")
     with c2:
         st.markdown(f'**Dry — {len(dry["features"])} regions**')
-        st.image(segmentation_overlay(dry,'rainbow'),use_container_width=True)
+        st.image(segmentation_overlay(dry,'rainbow'),width="stretch")
     st.caption('Numbers match the particle table. Zoom by opening the downloaded PNG at full resolution.')
 with tabs[2]:
     st.subheader('Size classes — comparable thresholds across the pair')
     st.caption(f'Small: < {cuts[0]:.2f} {wet["unit"]}  ·  Medium: {cuts[0]:.2f}–{cuts[1]:.2f}  ·  Large: ≥ {cuts[1]:.2f} {wet["unit"]}')
     st.markdown('🔵 Small　 🟢 Medium　 🩷 Large')
     c1,c2=st.columns(2)
-    with c1:st.image(segmentation_overlay(wet,'class'),use_container_width=True)
-    with c2:st.image(segmentation_overlay(dry,'class'),use_container_width=True)
+    with c1:st.image(segmentation_overlay(wet,'class'),width="stretch")
+    with c2:st.image(segmentation_overlay(dry,'class'),width="stretch")
     counts=pd.DataFrame({'Size':['Small','Medium','Large'],
       'Wet':[sum(p['class']==s for p in wet['features']) for s in ['Small','Medium','Large']],
       'Dry':[sum(p['class']==s for p in dry['features']) for s in ['Small','Medium','Large']]})
     st.markdown('**Size-class counts (same thresholds for wet and dry)**')
     counts['Wet share (%)']=(100*counts['Wet']/max(1,counts['Wet'].sum())).round(1)
     counts['Dry share (%)']=(100*counts['Dry']/max(1,counts['Dry'].sum())).round(1)
-    st.dataframe(counts,hide_index=True,use_container_width=True)
+    st.dataframe(counts,hide_index=True,width="stretch")
 with tabs[3]:
     st.subheader('Two-dimensional size and shape distribution')
-    st.pyplot(make_figures(wet,dry,cuts)['Measurements'],use_container_width=True)
+    st.pyplot(make_figures(wet,dry,cuts)['Measurements'],width="stretch")
     a,b=st.columns(2)
     for col,r,name in [(a,wet,'Wet'),(b,dry,'Dry')]:
         with col:
@@ -657,17 +643,17 @@ with tabs[4]:
             {'Metric':'Sample footprint','Wet':wet['footprint_area'],'Dry':dry['footprint_area'],'Unit':wet['area_unit']},
             {'Metric':'Median region equivalent diameter','Wet':change['wet_median_diameter'],'Dry':change['dry_median_diameter'],'Unit':wet['unit']},
             {'Metric':'Median candidate region area','Wet':change['wet_median_area'],'Dry':change['dry_median_area'],'Unit':wet['area_unit']}
-        ]),hide_index=True,use_container_width=True)
+        ]),hide_index=True,width="stretch")
     st.warning('**These are apparent 2D changes, not experimentally verified shrinkage.** Real volume shrinkage requires wet/dry thickness or 3D depth; true particle shrinkage requires matching the same physical fragments between images.')
 with tabs[5]:
     st.subheader('Color and browning indicators')
-    st.pyplot(make_figures(wet,dry,cuts)['Color change'],use_container_width=True)
+    st.pyplot(make_figures(wet,dry,cuts)['Color change'],width="stretch")
     st.markdown('**What L*, a*, and b* mean**')
     st.markdown('**L*** = lightness (0 is black; 100 is white). **a*** = green (negative) to red (positive). **b*** = blue (negative) to yellow (positive). **ΔE*76** measures distance between two average colors in this three-dimensional color space; **it is not a percentage**. A value such as **7.08** means **7.08 CIELAB units**, not 7.08% change.')
     st.caption('These are approximate camera-based color values. Control lighting, exposure, and white balance for scientific comparisons.')
 with tabs[6]:
     st.subheader('Candidate particle measurements')
-    st.dataframe(df,use_container_width=True,height=520,hide_index=True)
+    st.dataframe(df,width="stretch",height=520,hide_index=True)
     st.download_button('Download measurements CSV',data=df.to_csv(index=False).encode('utf-8-sig'),file_name='drymatter_candidate_regions.csv',mime='text/csv')
 
 st.divider()
