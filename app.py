@@ -167,61 +167,56 @@ def detect_tray_circle(rgb: np.ndarray) -> tuple[int, int, int] | None:
 
 
 def material_mask(rgb: np.ndarray):
-    """Detect material inside the automatically detected round tray."""
+    """Automatic material-only mask inside the detected tray; preserve open gaps.
+
+    Pixel classification uses chromatic cues in HSV and CIELAB. It does NOT
+    fill the tray or close over empty patches. Because material can resemble
+    reflections, the mask remains a camera-derived estimate requiring QC.
+    """
     h, w = rgb.shape[:2]
     tray = detect_tray_circle(rgb)
     if tray is None:
-        raise ValueError('Could not detect the round tray. Use an overhead photo with the tray fully visible.')
+        raise ValueError('Could not automatically detect the round tray.')
     cx, cy, r = tray
     yy, xx = np.ogrid[:h, :w]
-    tray_mask = (xx - cx) ** 2 + (yy - cy) ** 2 <= int((r * 0.965) ** 2)
-
+    # Avoid the bright metal rim. This ROI is NOT the material mask.
+    interior = ((xx - cx)**2 + (yy - cy)**2) <= (r * 0.95)**2
     smooth = cv2.GaussianBlur(rgb, (3, 3), 0.65)
     hsv = cv2.cvtColor(smooth, cv2.COLOR_RGB2HSV)
+    lab = cv2.cvtColor(smooth, cv2.COLOR_RGB2LAB)
     hue, sat, val = cv2.split(hsv)
+    a = lab[:, :, 1].astype(np.int16) - 128
+    b = lab[:, :, 2].astype(np.int16) - 128
     red_minus_blue = smooth[:, :, 0].astype(np.int16) - smooth[:, :, 2].astype(np.int16)
 
-    chromatic = (tray_mask & (sat >= 28) & (val >= 22) &
-                 (((hue <= 48) | (hue >= 168))) & (red_minus_blue > 4))
-    if int(chromatic.sum()) < max(250, int(tray_mask.sum() * 0.03)):
-        raise ValueError('Could not locate enough colored material inside the tray.')
-
-    ksize = max(9, int(round(min(h, w) * 0.012)) | 1)
-    closed = cv2.morphologyEx(
-        np.uint8(chromatic) * 255, cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
-    )
-    n, objects, stats, _ = cv2.connectedComponentsWithStats(closed, 8)
-    if n < 2:
-        silhouette = np.uint8(tray_mask)
-    else:
-        main = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-        seed = np.uint8(objects == main)
-        contours, _ = cv2.findContours(seed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        silhouette = np.zeros((h, w), np.uint8)
-        cv2.drawContours(silhouette, [max(contours, key=cv2.contourArea)], -1, 255, -1)
-    halo = max(5, int(round(min(h, w) * 0.010)) | 1)
-    nearby = cv2.dilate(
-        silhouette,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (halo, halo))
-    ) > 0
-    foreground = chromatic & nearby & tray_mask
+    # Warm colored apple tissue; low-chroma, bright metal stays unselected.
+    candidate = (interior & (sat >= 36) & (val >= 20) & (val <= 247) &
+                 (a > 2) & (b > 9) & (red_minus_blue > 9) &
+                 ((hue <= 48) | (hue >= 170)))
+    # Keep small disconnected material patches; remove isolated pixel noise.
     foreground = cv2.morphologyEx(
-        np.uint8(foreground) * 255, cv2.MORPH_OPEN,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+        (candidate.astype(np.uint8) * 255), cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     ) > 0
-    raw_count = int(foreground.sum())
-    if raw_count < 200:
-        raise ValueError('Too few material pixels remain inside the tray after segmentation.')
-    mask_info = {
-        'kind': 'tray-guided material mask',
-        'method': 'automatic round-tray detection + warm-color material mask',
-        'foreground_pixels': raw_count,
-        'footprint_pixels': int((silhouette > 0).sum()),
-        'mask_fraction_pct': round(raw_count * 100 / max(1, int(tray_mask.sum())), 2),
-        'limitation': 'Automatic detection assumes the sample sits inside a clearly visible round tray.'
+    material_px = int(foreground.sum())
+    tray_px = int(interior.sum())
+    if material_px < max(200, tray_px * .03):
+        raise ValueError('Material segmentation unreliable: too few warm-colored pixels inside the tray.')
+    coverage = 100 * material_px / tray_px
+    if coverage > 99.8:
+        raise ValueError('Material segmentation saturated the entire tray; cannot distinguish exposed tray.')
+    info = {
+        'kind': 'material-only color mask inside automatically detected tray',
+        'method': 'HSV and CIELAB color discrimination; no hole filling',
+        'foreground_pixels': material_px,
+        'tray_pixels': tray_px,
+        'coverage_pct': coverage,
+        'visible_empty_pct': 100 - coverage,
+        'mask_fraction_pct': coverage,
+        'limitation': 'Reflections, shadows, brown staining and translucent material can confound color-based segmentation.'
     }
-    return foreground, (silhouette > 0), mask_info
+    # roi denotes the observable tray INTERIOR, not a filled material footprint.
+    return foreground, interior, info
 
 def material_overlay(result: dict) -> np.ndarray:
     """QC view: GREEN = accepted material, MAGENTA = detected material edge."""
@@ -229,7 +224,7 @@ def material_overlay(result: dict) -> np.ndarray:
     mask = result['mask']
     rgb[mask] = np.clip(.55*rgb[mask].astype(float) +
                         .45*np.array([33, 211, 140]),0,255).astype(np.uint8)
-    outline = cv2.morphologyEx(np.uint8(result['roi'])*255,
+    outline = cv2.morphologyEx(np.uint8(result['mask'])*255,
                   cv2.MORPH_GRADIENT,np.ones((3,3),np.uint8))>0
     rgb[outline] = (225, 55, 170)
     return rgb
@@ -303,6 +298,8 @@ def detect_regions(rgb: np.ndarray, mm: float|None) -> dict:
             'area_unit':'mm²' if mm is not None else 'px²',
             'colored_area':float(fg.sum())*factor**2,
             'footprint_area':float(roi.sum())*factor**2,
+            'tray_coverage_pct': float(fg.sum())/max(1,int(roi.sum()))*100,
+            'visible_empty_pct': 100-float(fg.sum())/max(1,int(roi.sum()))*100,
             'mean_lab':mean_lab,'composition':groups,
             'L_sample':L[fg][::max(1,int(fg.sum()//13000))]}
 
@@ -409,7 +406,7 @@ def make_figures(wet:dict,dry:dict,cuts:tuple[float,float])->dict[str,Figure]:
     paired=[(wet,'WET / BEFORE',TEAL),(dry,'DRY / AFTER',ORANGE)]
     figs={}
     f=new_figure('Material detection — automatic tray detection',
-        'GREEN = detected pomace pixels; PINK = automatically detected tray/sample boundary used for analysis. Review before interpreting measurements.')
+        'GREEN = classified material; uncolored gaps = excluded pixels; PINK = tray interior limit. Review the mask before measuring.')
     gs=f.add_gridspec(1,2,left=.024,right=.977,bottom=.057,top=.854,wspace=.040)
     for i,(r,t,c) in enumerate(paired):
         a=f.add_subplot(gs[0,i]);a.imshow(material_overlay(r));a.axis('off')
@@ -513,8 +510,16 @@ def change_metrics(wet:dict,dry:dict)->dict:
     wmed,dmed=med(wet,'eq_diameter'),med(dry,'eq_diameter')
     warea,darea=med(wet,'area'),med(dry,'area')
     return {'comparable':comparable,
+            'wet_material_pixels':int(wet['mask'].sum()),
+            'dry_material_pixels':int(dry['mask'].sum()),
+            'wet_material_area':float(wet['colored_area']),
+            'dry_material_area':float(dry['colored_area']),
+            'projected_area_change_pct':reduction(wet['colored_area'],dry['colored_area']) if comparable else None,
             'apparent_colored_area_reduction_pct':reduction(wet['colored_area'],dry['colored_area']) if comparable else None,
-            'apparent_footprint_reduction_pct':reduction(wet['footprint_area'],dry['footprint_area']) if comparable else None,
+            'apparent_footprint_reduction_pct':None,
+            'wet_tray_coverage_pct':wet['tray_coverage_pct'],
+            'dry_tray_coverage_pct':dry['tray_coverage_pct'],
+            'coverage_change_pp':dry['tray_coverage_pct']-wet['tray_coverage_pct'],
             'median_region_diameter_change_pct':reduction(wmed,dmed) if comparable and wmed is not None else None,
             'median_region_area_change_pct':reduction(warea,darea) if comparable and warea is not None else None,
             'wet_median_diameter':wmed,'dry_median_diameter':dmed,
@@ -527,22 +532,29 @@ def build_export(wet:dict,dry:dict,cuts:tuple[float,float],figs:dict[str,Figure]
     summary={
       'app':'DryMatter Vision — Streamlit',
       'date_utc':datetime.now(timezone.utc).isoformat(),
-      'method':'shape-independent color/intensity sample mask; gradient watershed candidate regions',
+      'method':'tray-guided HSV/CIELAB foreground without gap filling; gradient watershed candidate regions',
       'unit':wet['unit'], 'area_unit':wet['area_unit'],
       'size_class_cutoffs':{'small_below':cuts[0],'large_at_or_above':cuts[1]},
       'wet':{'regions':len(wet['features']),'material_area':wet['colored_area'],
-             'footprint_area':wet['footprint_area'],'mean_Lab':wet['mean_lab'].tolist(),
+             'tray_interior_area':wet['footprint_area'],'tray_coverage_pct':wet['tray_coverage_pct'],'visible_empty_pct':wet['visible_empty_pct'],'mean_Lab':wet['mean_lab'].tolist(),
              'tone_percent':wet['composition'],'mm_per_px':wet['mm_per_px']},
       'dry':{'regions':len(dry['features']),'material_area':dry['colored_area'],
-             'footprint_area':dry['footprint_area'],'mean_Lab':dry['mean_lab'].tolist(),
+             'tray_interior_area':dry['footprint_area'],'tray_coverage_pct':dry['tray_coverage_pct'],'visible_empty_pct':dry['visible_empty_pct'],'mean_Lab':dry['mean_lab'].tolist(),
              'tone_percent':dry['composition'],'mm_per_px':dry['mm_per_px']},
       'delta_E76_mean_color':float(np.linalg.norm(wet['mean_lab']-dry['mean_lab'])),
       'apparent_2D_changes':change_metrics(wet,dry),
-      'warning':'Candidate image regions are not verified individual particles. Area changes are not true volumetric shrinkage. Color change needs matched lighting and a color reference.'
+      'projected_material_area_change_pct':change_metrics(wet,dry)['projected_area_change_pct'],
+      'true_volume_shrinkage_pct':None,
+      'volume_status':'Not measurable from single top-down wet/dry images; thickness/depth required',
+      'warning':'True 3D volume loss cannot be determined from a single overhead image pair without thickness/depth data. Candidate image regions are not verified individual particles. Area changes are not true volumetric shrinkage. Color change needs matched lighting and a color reference.'
     }
     with zipfile.ZipFile(bio,'w',zipfile.ZIP_DEFLATED) as z:
         z.writestr('summary.json',json.dumps(summary,indent=2,ensure_ascii=False))
         z.writestr('candidate_regions.csv',df.to_csv(index=False))
+        z.writestr('material_area_comparison.csv', pd.DataFrame([
+            {'condition':'wet','material_pixels':int(wet['mask'].sum()),'material_area':wet['colored_area'],'unit':wet['area_unit']},
+            {'condition':'dry','material_pixels':int(dry['mask'].sum()),'material_area':dry['colored_area'],'unit':dry['area_unit']}
+        ]).to_csv(index=False))
         for cond,result in [('wet',wet),('dry',dry)]:
             for mode in ('rainbow','class'):
                 z.writestr(f'{cond}_{mode}_labeled.png',photo_png(segmentation_overlay(result,mode)))
@@ -616,17 +628,17 @@ c1,c2,c3,c4=st.columns(4)
 c1.metric('Wet candidate regions',len(wet['features']))
 c2.metric('Dry candidate regions',len(dry['features']))
 c3.metric('Mean color difference ΔE*76',f'{np.linalg.norm(wet["mean_lab"]-dry["mean_lab"]):.2f}')
-c4.metric('2D area reduction', (f"{change_metrics(wet,dry)['apparent_colored_area_reduction_pct']:+.1f}%" if change_metrics(wet,dry)['comparable'] else 'Not calibrated'),help='Apparent change in segmented colored pixels after mm calibration—not true shrinkage.')
+c4.metric('2D area reduction', (f"{change_metrics(wet,dry)['apparent_colored_area_reduction_pct']:+.1f}%" if change_metrics(wet,dry)['comparable'] else 'Not calibrated'),help='Change in classified material pixels after calibration. This is 2D coverage, not true volume loss.')
 if wet['unit']!='mm':
     st.warning('Automatic ruler calibration was not validated in BOTH images. Measurements are in pixels. '+res['wet_msg']+' '+res['dry_msg'])
 else:
     st.caption('Wet: '+res['wet_msg']+'   |   Dry: '+res['dry_msg'])
-st.markdown('<div class="info-box">Contours are <b>candidate 2D image regions</b>, not verified separate physical particles. The mask is generated automatically inside the detected tray; review it before using counts or areas. Projected-area changes do not measure true volume shrinkage.</div>',unsafe_allow_html=True)
+st.markdown('<div class="info-box">Green marks classified material only; bright exposed tray/gaps are excluded where distinguishable. Colored coverage is a <b>2D image measurement</b>, not 3D volume. Candidate regions are not validated individual physical particles.</div>',unsafe_allow_html=True)
 
 tabs=st.tabs(['Material mask','All fragments','Size classes','Measurements','Shrinkage comparison','Color change','Particle table'])
 with tabs[0]:
     st.subheader('Material mask — quality check')
-    st.caption('Green shows detected pomace; magenta marks the automatically detected tray/sample boundary used for analysis.')
+    st.caption('Green = detected material only; exposed tray and gaps remain uncolored. Magenta = detected material pixel boundary (including holes).')
     col1,col2=st.columns(2)
     with col1:
         st.markdown('**WET / BEFORE**')
@@ -666,10 +678,14 @@ with tabs[3]:
         with col:
             st.markdown('**'+name+'**')
             st.metric('Material-colored area',f'{r["colored_area"]:,.0f} {r["area_unit"]}')
-            st.metric('Observed material footprint',f'{r["footprint_area"]:,.0f} {r["area_unit"]}')
-    st.caption('These area values are camera-visible projections, not physical surface area or 3D volume.')
+            st.metric('Tray interior area (reference)',f'{r["footprint_area"]:,.0f} {r["area_unit"]}')
+            st.metric('Tray coverage',f'{r["tray_coverage_pct"]:.1f}%')
+            st.metric('Exposed tray / visible gaps',f'{r["visible_empty_pct"]:.1f}%')
+    st.caption('Material area counts only pixels classified as material. Tray interior is a fixed reference, not a material footprint. All results are projected 2D measurements, not 3D volume.')
 with tabs[4]:
-    st.subheader('Apparent 2D change — not true volume shrinkage')
+    st.subheader('Measured material projected-area change')
+    st.latex(r'S_{A}(\%)=\frac{A_{\mathrm{wet}}-A_{\mathrm{dry}}}{A_{\mathrm{wet}}}\times100')
+    st.caption('Every material-classified pixel counts, wherever it lies inside the tray. Exposed metal does not count. Positive = smaller dry projected area; negative = larger dry projected area.')
     change=change_metrics(wet,dry)
     if not change['comparable']:
         st.warning('Cannot provide a defensible shrinkage percentage: valid ruler calibration is required in BOTH photographs. Upload both calibrated images and rerun.')
@@ -678,18 +694,23 @@ with tabs[4]:
             return 'Not available' if value is None else f'{value:+.1f}%'
         a,b,c=st.columns(3)
         a.metric('Colored area reduction (2D)',display_change(change['apparent_colored_area_reduction_pct']),help='Positive means less color-segmented surface in the dry photo. Not true volume shrinkage.')
-        b.metric('Footprint reduction (2D)',display_change(change['apparent_footprint_reduction_pct']),help='Positive means smaller projected sample boundary. A tray may constrain this.')
+        b.metric('Tray coverage change (percentage points)',f"{change['coverage_change_pp']:+.1f} pp",help='Dry coverage percentage minus wet coverage percentage. Negative means more visibly uncovered tray; NOT volume shrinkage.')
         c.metric('Median region area reduction',display_change(change['median_region_area_change_pct']),help='Unmatched candidate regions. A distribution statistic, not physical particle shrinkage.')
         if change['apparent_colored_area_reduction_pct'] is not None and change['apparent_colored_area_reduction_pct']<0:
             st.info('The apparent segmented area INCREASED after drying. A negative reduction is not evidence of physical expansion; changing visibility or segmentation can cause this.')
-        st.markdown('**Measured projected quantities**')
+        st.markdown('**Actual material pixels and calibrated areas**')
+        st.dataframe(pd.DataFrame([
+            {'Condition':'Wet', 'Detected material pixels':int(wet['mask'].sum()), 'Area (mm²)':wet['colored_area']},
+            {'Condition':'Dry', 'Detected material pixels':int(dry['mask'].sum()), 'Area (mm²)':dry['colored_area']}
+        ]), hide_index=True, use_container_width=True)
+        st.markdown('**Other measured quantities**')
         st.dataframe(pd.DataFrame([
             {'Metric':'Colored material area','Wet':wet['colored_area'],'Dry':dry['colored_area'],'Unit':wet['area_unit']},
-            {'Metric':'Sample footprint','Wet':wet['footprint_area'],'Dry':dry['footprint_area'],'Unit':wet['area_unit']},
+            {'Metric':'Tray interior reference area','Wet':wet['footprint_area'],'Dry':dry['footprint_area'],'Unit':wet['area_unit']},
             {'Metric':'Median region equivalent diameter','Wet':change['wet_median_diameter'],'Dry':change['dry_median_diameter'],'Unit':wet['unit']},
             {'Metric':'Median candidate region area','Wet':change['wet_median_area'],'Dry':change['dry_median_area'],'Unit':wet['area_unit']}
         ]),hide_index=True,use_container_width=True)
-    st.warning('**These are apparent 2D changes, not experimentally verified shrinkage.** Real volume shrinkage requires wet/dry thickness or 3D depth; true particle shrinkage requires matching the same physical fragments between images.')
+    st.warning('**True 3D volume shrinkage is not measurable from these top-view photos alone.** Drying may reduce height while visible tray coverage stays the same or increases. To calculate volume loss, you need depth or thickness measurements (e.g., side view, calibrated depth map or 3D scan).')
 with tabs[5]:
     st.subheader('Color and browning indicators')
     st.pyplot(make_figures(wet,dry,cuts)['Color change'],use_container_width=True)
