@@ -55,37 +55,102 @@ def read_uploaded(data:bytes,max_side:int=1150)->tuple[np.ndarray,float|None,str
     mm,msg=auto_ruler(rgb)
     return rgb,mm,msg
 
-def auto_ruler(rgb: np.ndarray) -> tuple[float | None, str]:
-    """Conservative auto-detection of horizontal marks 1 cm apart on a vertical ruler."""
-    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+def _ruler_stripe_candidates(gray: np.ndarray, orientation: str) -> list[tuple]:
+    """Find the 1-mm tick lattice of a metric ruler using autocorrelation.
+
+    The scanner finds repeated fine/medium/long tick lines; it does NOT use
+    handwritten guesses about the ruler's cm-label positions.  Rotating the
+    image before calling this also supports horizontal rulers.
+    """
+    from scipy.ndimage import gaussian_filter1d
+    from scipy.signal import correlate
+
     h, w = gray.shape
-    if min(h, w) < 230:
-        return None, 'Too small for reliable ruler calibration; using pixels.'
+    if h < 220 or w < 180:
+        return []
+    width = max(7, int(round(w * .014)))
+    stride = max(4, width // 2)
+    # Explore the full image, so the ruler need not appear at the right edge.
+    # Stay away from the very edge, where a photo frame can mimic a stripe.
+    xs = range(max(3, int(w * .035)), max(4, int(w * .965) - width), stride)
+    windows = [(int(.10*h), int(.90*h)), (int(.23*h), int(.80*h))]
     candidates = []
-    for f in list(np.linspace(.060, .19, 8)) + list(np.linspace(.81, .935, 13)):
-        x = int(round(w*f)); half=max(5,int(w*.012))
-        x0, x1=max(0,x-half),min(w,x+half)
-        ya, yb=int(h*.060),int(h*.90)
-        dark = (gray[ya:yb,x0:x1] < 118).sum(axis=1).astype(np.float32)
-        smooth = cv2.GaussianBlur(dark[:,None], (1,3),0)[:,0]
-        if smooth.max() < 4: continue
-        peaks,_=find_peaks(smooth,prominence=1.9,
-                            distance=max(9,int(h*.023)),
-                            height=max(3.6,float(smooth.max())*.40))
-        yy=peaks+ya
-        if len(yy)<13:continue
-        dd=np.diff(yy).astype(float)
-        step=float(np.median(dd))
-        if not h*.022<=step<=h*.10:continue
-        regularity=float((abs(dd-step)<max(2.4,step*.16)).mean())
-        if regularity<.84 or yy[-1]-yy[0]<h*.38: continue
-        score=regularity*100+min(len(yy),30)*1.5+smooth[peaks].mean()*.3
-        candidates.append((score,step,len(yy)))
+    low_q = max(2.7, h * .0035)
+    high_q = min(20., h * .025)
+    if high_q <= low_q:
+        return []
+
+    # A 1-mm tick interval is normally 3-20 pixels for the analyzed image;
+    # checking both the 5-mm and 10-mm repetitions rejects noisy textures.
+    for x in xs:
+        for ya, yb in windows:
+            stripe = gray[ya:yb, x:x+width].mean(axis=1)
+            z = gaussian_filter1d(stripe, 1.) - gaussian_filter1d(stripe, max(9., h*.025))
+            z -= z.mean()
+            if z.std() < 2.0:
+                continue
+            n = z.size
+            max_lag = min(int(h*.21), n//3, int(10*high_q+4))
+            if max_lag < 10*low_q:
+                continue
+            ac = correlate(z, z, mode='full', method='fft')[n-1:n+max_lag].astype(float)
+            squares = np.r_[0., np.cumsum(z*z)]
+            lags = np.arange(1, max_lag+1)
+            left = squares[n-lags]
+            right = squares[n]-squares[lags]
+            ac = ac[1:]/(np.sqrt(np.maximum(left*right, 1e-12)))
+
+            def strength(q: float, count: int) -> float:
+                at = int(round(q*count))-1
+                if at < 2 or at >= len(ac)-2:
+                    return -1.
+                return float(np.max(ac[at-1:at+2]))
+
+            best = (-1., 0.)
+            for q in np.arange(low_q, high_q, .10):
+                scores = [strength(q,k) for k in (1, 2, 3, 4, 5, 6, 8, 10)]
+                if scores[4] < .38 or scores[7] < .38:
+                    continue
+                score = (scores[0]*.10 + scores[1]*.10 + scores[2]*.10 +
+                         scores[3]*.05 + scores[4]*.23 + scores[5]*.07 +
+                         scores[6]*.05 + scores[7]*.30)
+                if score > best[0]:
+                    best = (score, float(q))
+            if best[0] >= .66:
+                candidates.append((best[0], best[1], x, ya, orientation))
+    return candidates
+
+
+def auto_ruler(rgb: np.ndarray) -> tuple[float | None, str]:
+    """Automatically calibrate from a visible *metric* ruler, if verifiable.
+
+    Works with horizontal or vertical rulers, without user-entered distances.
+    Does not pretend that an unrecognizable ruler is calibrated.
+    """
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    candidates = _ruler_stripe_candidates(gray, 'vertical')
+    candidates += _ruler_stripe_candidates(np.rot90(gray), 'horizontal')
     if not candidates:
-        return None,'No trustworthy ruler pattern; reporting pixels.'
-    _, step, n=max(candidates)
-    mm=10/step
-    return mm,f'Ruler recognized: 1 cm ≈ {step:.1f} px ({mm:.4f} mm/px, {n} ticks).'
+        return None, 'Could not validate regularly spaced metric ruler ticks; reporting pixels.'
+
+    # Multiple adjacent scanlines must agree. This blocks a single textured
+    # object accidentally resembling ruler marks.
+    candidates.sort(reverse=True)
+    best = candidates[0]
+    strong = [c for c in candidates if c[0] >= max(.66, best[0]-.13)
+              and abs(c[1]-best[1]) <= max(.4, .075*best[1])
+              and c[4] == best[4] and abs(c[2]-best[2]) <= max(22, int(rgb.shape[1]*.05))]
+    distinct_stripes = len(set(c[2] for c in strong))
+    if distinct_stripes < 2:
+        return None, 'Ruler-like marks found, but adjacent scanlines did not confirm their spacing.'
+
+    # 1 pixel per tick should correspond to 1 mm, not 1 cm.  Robustly combine
+    # the corroborating stripe estimates rather than a single noisy reading.
+    q = float(np.median([c[1] for c in strong]))
+    mm_per_px = 1.0/q
+    return mm_per_px, (f'Metric ruler validated automatically ({best[4]}): '
+                       f'1 mm ≈ {q:.2f} px; 10 mm ≈ {q*10:.1f} px; '
+                       f'{mm_per_px:.5f} mm/px, {distinct_stripes} agreeing scanlines.')
 
 
 def material_mask(rgb: np.ndarray, bounds: tuple[float, float, float, float] | None = None):
