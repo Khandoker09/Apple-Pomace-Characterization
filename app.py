@@ -52,19 +52,37 @@ CLASS_RGB={'Small':(41,135,239),'Medium':(19,184,155),'Large':(225,77,152)}
 CALIBRATION_TOLERANCE = .15
 
 
-def read_uploaded(data:bytes,max_side:int=1150,manual_mm_per_px:float|None=None)->tuple[np.ndarray,float|None,str]:
-    """Load an image, shrink it to max_side, and calibrate it.
+CALIBRATION_SIDE = 2300   # ruler ticks are read on a larger copy than the one displayed
 
-    manual_mm_per_px refers to the RESIZED image (the one shown in the app).
+
+def read_uploaded(data:bytes,max_side:int=1150):
+    """Load an image and calibrate it automatically from the ruler.
+
+    Returns (rgb, mm_per_px, message, ruler_mask). mm_per_px refers to the
+    displayed/analyzed image (longest side max_side). The ruler is read on a
+    larger copy for precision. ruler_mask marks the ruler so it can never be
+    mistaken for sample material (None if no ruler was validated).
     """
     with Image.open(io.BytesIO(data)) as im:
         im=ImageOps.exif_transpose(im).convert('RGB')
+        big=im.copy()
+        big.thumbnail((CALIBRATION_SIDE,CALIBRATION_SIDE),Image.Resampling.LANCZOS)
         im.thumbnail((max_side,max_side),Image.Resampling.LANCZOS)
         rgb=np.asarray(im).copy()
-    if manual_mm_per_px is not None and manual_mm_per_px>0:
-        return rgb,float(manual_mm_per_px),f'Manual scale: {manual_mm_per_px:.5f} mm/px.'
-    mm,msg=auto_ruler(rgb)
-    return rgb,mm,msg
+        rgb_big=np.asarray(big).copy()
+    mm_big,msg,info=auto_ruler(rgb_big)
+    if mm_big is None and rgb_big.shape!=rgb.shape:
+        mm_small,msg_small,info_small=auto_ruler(rgb)
+        if mm_small is not None:
+            return rgb,mm_small,msg_small,ruler_exclusion_mask(rgb.shape[:2],info_small,1.0)
+        return rgb,None,msg,None
+    if mm_big is None:
+        return rgb,None,msg,None
+    # Convert mm/px of the large copy to mm/px of the displayed copy.
+    ratio=0.5*(rgb_big.shape[1]/rgb.shape[1]+rgb_big.shape[0]/rgb.shape[0])
+    mm=mm_big*ratio
+    excl=ruler_exclusion_mask(rgb.shape[:2],info,rgb.shape[1]/rgb_big.shape[1])
+    return rgb,mm,msg+f' (scale on displayed image: {mm:.5f} mm/px)',excl
 
 def _ruler_stripe_candidates(gray: np.ndarray, orientation: str) -> list[tuple]:
     """Find the 1-mm tick lattice of a metric ruler using autocorrelation.
@@ -148,21 +166,34 @@ def _ruler_stripe_candidates(gray: np.ndarray, orientation: str) -> list[tuple]:
                     s_best_val, q_best = max(near)
                     break
             if s_best_val >= .66:
-                candidates.append((s_best_val, float(q_best), x, ya, orientation))
+                # Refine the 1-mm period from the 10-mm repetition peak (sub-pixel).
+                lag10 = q_best*10
+                lo_i, hi_i = int(lag10*.97)-1, int(lag10*1.03)
+                if 1 <= lo_i < hi_i < len(ac)-1:
+                    i_pk = lo_i + int(np.argmax(ac[lo_i:hi_i]))
+                    if 1 <= i_pk < len(ac)-1:
+                        y0_, y1_, y2_ = ac[i_pk-1], ac[i_pk], ac[i_pk+1]
+                        den = y0_ - 2*y1_ + y2_
+                        delta = .5*(y0_-y2_)/den if abs(den) > 1e-9 else 0.
+                        q_ref = ((i_pk+1) + float(np.clip(delta,-.5,.5)))/10.
+                        if abs(q_ref-q_best) <= .04*q_best:
+                            q_best = q_ref
+                candidates.append((s_best_val, float(q_best), x, ya, orientation, width))
     return candidates
 
 
-def auto_ruler(rgb: np.ndarray) -> tuple[float | None, str]:
+def auto_ruler(rgb: np.ndarray):
     """Automatically calibrate from a visible *metric* ruler, if verifiable.
 
     Works with horizontal or vertical rulers, without user-entered distances.
     Does not pretend that an unrecognizable ruler is calibrated.
+    Returns (mm_per_px | None, message, ruler_info | None).
     """
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
     candidates = _ruler_stripe_candidates(gray, 'vertical')
     candidates += _ruler_stripe_candidates(np.ascontiguousarray(np.rot90(gray)), 'horizontal')
     if not candidates:
-        return None, 'Could not validate regularly spaced metric ruler ticks; reporting pixels.'
+        return None, 'Could not validate regularly spaced metric ruler ticks; reporting pixels.', None
 
     # Multiple adjacent scanlines must agree. This blocks a single textured
     # object accidentally resembling ruler marks.
@@ -173,15 +204,49 @@ def auto_ruler(rgb: np.ndarray) -> tuple[float | None, str]:
               and c[4] == best[4] and abs(c[2]-best[2]) <= max(22, int(rgb.shape[1]*.05))]
     distinct_stripes = len(set(c[2] for c in strong))
     if distinct_stripes < 2:
-        return None, 'Ruler-like marks found, but adjacent scanlines did not confirm their spacing.'
+        return None, 'Ruler-like marks found, but adjacent scanlines did not confirm their spacing.', None
 
     # 1 pixel per tick should correspond to 1 mm, not 1 cm.  Robustly combine
     # the corroborating stripe estimates rather than a single noisy reading.
     q = float(np.median([c[1] for c in strong]))
     mm_per_px = 1.0/q
+    width = strong[0][5]
+    info = {'orientation': best[4],
+            'tick_lo': int(min(c[2] for c in strong)),
+            'tick_hi': int(max(c[2] for c in strong) + width),
+            'width': int(width), 'q': q}
     return mm_per_px, (f'Metric ruler validated automatically ({best[4]}): '
                        f'1 mm ≈ {q:.2f} px; 10 mm ≈ {q*10:.1f} px; '
-                       f'{mm_per_px:.5f} mm/px, {distinct_stripes} agreeing scanlines.')
+                       f'{mm_per_px:.5f} mm/px, {distinct_stripes} agreeing scanlines.'), info
+
+
+def ruler_exclusion_mask(shape: tuple[int, int], info: dict | None, scale: float = 1.0):
+    """Boolean mask of the ruler body, so it is never counted as sample.
+
+    The tick edge is known from the validated tick stripes; the ruler body
+    extends from that edge toward the nearer image border. `info` is in the
+    coordinates of the image the ruler was read on; `scale` converts to `shape`.
+    """
+    if not info:
+        return None
+    h, w = shape
+    lo = info['tick_lo']*scale
+    hi = info['tick_hi']*scale
+    half = info['width']*scale*.5
+    mask = np.zeros((h, w), bool)
+    size = w if info['orientation'] == 'vertical' else h
+    if (lo+hi)/2 > size/2:
+        a, b = int(round(lo+half)), size       # body toward the far border
+    else:
+        a, b = 0, int(round(hi-half))
+    a, b = max(0, a), min(size, b)
+    if b <= a:
+        return None
+    if info['orientation'] == 'vertical':
+        mask[:, a:b] = True
+    else:
+        mask[a:b, :] = True
+    return mask
 
 
 def reconcile_calibrations(wm: float | None, dm: float | None,
@@ -190,12 +255,13 @@ def reconcile_calibrations(wm: float | None, dm: float | None,
     if wm is not None and dm is not None and abs(wm/dm - 1) > CALIBRATION_TOLERANCE:
         note = (f' REJECTED: wet scale ({wm:.5f} mm/px) and dry scale ({dm:.5f} mm/px) '
                 f'differ by more than {CALIBRATION_TOLERANCE*100:.0f}%. '
-                'Use the manual scale override in the sidebar or retake the photos from the same distance.')
+                'Retake the photos from the same distance with the ruler fully visible.')
         return None, None, wmsg + note, dmsg + note
     return wm, dm, wmsg, dmsg
 
 
-def material_mask(rgb: np.ndarray, bounds: tuple[float, float, float, float] | None = None):
+def material_mask(rgb: np.ndarray, bounds: tuple[float, float, float, float] | None = None,
+                  exclude: np.ndarray | None = None):
     """Estimate a sample silhouette using color seeds + constrained GrabCut.
 
     The optional bounds are an EXCLUSION crop (left, top, right, bottom,
@@ -212,6 +278,7 @@ def material_mask(rgb: np.ndarray, bounds: tuple[float, float, float, float] | N
         raise ValueError('Input photograph is too small for reliable analysis.')
     patch = np.ascontiguousarray(rgb[y0:y1, x0:x1])
     ph, pw = patch.shape[:2]
+    ex = (exclude[y0:y1, x0:x1] if exclude is not None else np.zeros((ph, pw), bool))
     smooth = cv2.GaussianBlur(patch, (5, 5), 0)
     hsv = cv2.cvtColor(smooth, cv2.COLOR_RGB2HSV)
     hue, sat, val = cv2.split(hsv)
@@ -219,7 +286,7 @@ def material_mask(rgb: np.ndarray, bounds: tuple[float, float, float, float] | N
     # High-chroma, darker material is a more trustworthy SEED than every
     # 'warm' pixel: paper, beige worktops and wood can also be warm.
     warm = (((hue < 44) | (hue > 168)) & (sat >= 60) & (val >= 30))
-    seed = (warm & ((sat >= 88) | (val < 145))).astype(np.uint8)
+    seed = (warm & ((sat >= 88) | (val < 145)) & ~ex).astype(np.uint8)
     k = max(3, int(round(min(ph, pw)*.012)) | 1)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(k,k))
     seed = cv2.morphologyEx(seed, cv2.MORPH_CLOSE, kernel)
@@ -256,7 +323,8 @@ def material_mask(rgb: np.ndarray, bounds: tuple[float, float, float, float] | N
     erode_size=max(3,int(min(ph,pw)*.012)|1)
     inner=cv2.erode(sure,cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(erode_size,erode_size)))
     gc[inner>0]=cv2.GC_FGD
-    margin=max(3,int(min(ph,pw)*.012))
+    gc[ex]=cv2.GC_BGD   # the ruler is never sample material
+    margin=2            # keep the frame margin tiny: a dish may touch the photo edge
     gc[:margin,:]=cv2.GC_BGD;gc[-margin:,:]=cv2.GC_BGD
     gc[:,:margin]=cv2.GC_BGD;gc[:,-margin:]=cv2.GC_BGD
     if not np.any(gc==cv2.GC_FGD):
@@ -284,7 +352,7 @@ def material_mask(rgb: np.ndarray, bounds: tuple[float, float, float, float] | N
     silhouette=cv2.morphologyEx(silhouette,cv2.MORPH_OPEN,
                     cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(trim,trim)))
     # Reject neutral/white reflections but retain brown/dark material.
-    foreground=(silhouette>0)&(sat>=35)&(val>=25)
+    foreground=(silhouette>0)&(sat>=35)&(val>=25)&~ex
     if foreground.sum() < max(200,ph*pw*.005):
         raise ValueError('Too few material pixels detected automatically; check illumination and background.')
 
@@ -313,8 +381,11 @@ def material_mask(rgb: np.ndarray, bounds: tuple[float, float, float, float] | N
     mask=np.zeros((h,w),bool); footprint=np.zeros((h,w),bool)
     mask[y0:y1,x0:x1]=foreground
     footprint[y0:y1,x0:x1]=silhouette>0
-    touches_frame = bool(np.any(silhouette[0]) or np.any(silhouette[-1]) or
-                         np.any(silhouette[:,0]) or np.any(silhouette[:,-1]))
+    # Only a substantial contact with the photo edge suggests a cropped sample;
+    # a dish rim merely grazing the edge is not a problem.
+    fgm = foreground.astype(np.uint8)
+    touches_frame = bool(fgm[0].mean() > .08 or fgm[-1].mean() > .08 or
+                         fgm[:,0].mean() > .08 or fgm[:,-1].mean() > .08)
     coverage = float(mask.mean())
     uncertain = touches_frame or coverage > .65 or coverage < .015
     info={'kind':'image-derived irregular silhouette',
@@ -341,8 +412,8 @@ def material_overlay(result: dict) -> np.ndarray:
     return rgb
 
 
-def detect_regions(rgb: np.ndarray, mm: float|None, bounds=None) -> dict:
-    fg,roi,info=material_mask(rgb,bounds)
+def detect_regions(rgb: np.ndarray, mm: float|None, bounds=None, exclude=None) -> dict:
+    fg,roi,info=material_mask(rgb,bounds,exclude)
     if fg.sum()<300:
         raise ValueError('The colored sample was not identified. Use a clear overhead photo in a contrasting tray.')
     hsv=cv2.cvtColor(rgb,cv2.COLOR_RGB2HSV)
@@ -653,11 +724,6 @@ with st.sidebar:
     st.header('Analyze samples')
     wet_file=st.file_uploader('Wet / Before',type=['png','jpg','jpeg','webp','tif','tiff'],key='wet')
     dry_file=st.file_uploader('Dry / After',type=['png','jpg','jpeg','webp','tif','tiff'],key='dry')
-    manual_scale=st.number_input('Manual scale override (mm per pixel, 0 = automatic ruler)',
-                                 min_value=0.0,value=0.0,step=0.001,format='%.5f',
-                                 help='Refers to the image as shown in the app (longest side resized to 1150 px). '
-                                      'Applied to BOTH photos; use it only if both were taken from the same distance. '
-                                      'Example: if 10 mm spans 57 px, enter 10/57 = 0.17544.')
     analyze=st.button('Analyze images',type='primary',width="stretch",disabled=wet_file is None or dry_file is None)
     st.caption('Automatic processing: sample detection and ruler reading. For comparable measurements, use straight overhead photos, even lighting and a visible ruler in both images.')
     st.divider()
@@ -666,13 +732,12 @@ with st.sidebar:
 if analyze:
     try:
         with st.spinner('Finding material, calibrating rulers, and segmenting visible regions…'):
-            override=manual_scale if manual_scale>0 else None
-            wr,wm,wmsg=read_uploaded(wet_file.getvalue(),manual_mm_per_px=override)
-            dr,dm,dmsg=read_uploaded(dry_file.getvalue(),manual_mm_per_px=override)
+            wr,wm,wmsg,wx=read_uploaded(wet_file.getvalue())
+            dr,dm,dmsg,dx=read_uploaded(dry_file.getvalue())
             # Wet and dry share one camera setup, so inconsistent scales are rejected.
             wm,dm,wmsg,dmsg=reconcile_calibrations(wm,dm,wmsg,dmsg)
-            wet=detect_regions(wr,wm)
-            dry=detect_regions(dr,dm)
+            wet=detect_regions(wr,wm,exclude=wx)
+            dry=detect_regions(dr,dm,exclude=dx)
             cuts=assign_classes(wet,dry)
             figs=make_figures(wet,dry,cuts)
             df=table_rows(wet,dry)
@@ -764,7 +829,7 @@ with tabs[4]:
     st.subheader('Apparent 2D change — not true volume shrinkage')
     change=change_metrics(wet,dry)
     if not change['comparable']:
-        st.warning('Cannot provide a defensible shrinkage percentage: valid ruler calibration is required in BOTH photographs. Upload both calibrated images and rerun, or enter a manual scale in the sidebar.')
+        st.warning('Cannot provide a defensible shrinkage percentage: valid ruler calibration is required in BOTH photographs. Upload both calibrated images and rerun.')
     else:
         def display_change(value):
             return 'Not available' if value is None else f'{value:+.1f}%'
