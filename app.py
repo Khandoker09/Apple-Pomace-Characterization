@@ -1,8 +1,8 @@
-"""DryMatter Vision: four analyses.
+"""DryMatter Vision: four analyses — graph-based appearance-region alternative.
 1. Automatic tray-guided material mask
 2. Mean candidate-region area reduction
 3. Camera-based CIELAB color quality control
-4. Dual-scale candidate-region segmentation and multi-view size distribution
+4. Graph-based candidate appearance segmentation and multi-view size distribution
 
 Research limitation: these regions are not validated physical particles.
 Top-down photos do not measure thickness or volume.
@@ -23,7 +23,7 @@ from scipy import ndimage as ndi
 from scipy.signal import find_peaks
 from skimage.morphology import h_maxima, remove_small_objects
 from skimage.measure import regionprops
-from skimage.segmentation import watershed
+from skimage.segmentation import watershed, felzenszwalb
 from skimage.feature import peak_local_max
 from skimage.filters import sobel
 
@@ -198,74 +198,49 @@ def material_mask(rgb: np.ndarray):
 
 
 def segmentation(rgb: np.ndarray, mask: np.ndarray, detail: bool = True):
-    """Texture-and-shape-assisted candidate region segmentation.
+    """Graph-based appearance segmentation (Felzenszwalb-Huttenlocher).
 
-    Crucially, candidate regions are NOT guaranteed to be single physical
-    particles. Hidden/overlapping pieces cannot be resolved from an overhead
-    photograph without a trained, validated instance model.
+    This is NOT graph-based appearance segmentation. Local pixel similarity in color/texture determines
+    candidate region boundaries. It is unsupervised and should not be mistaken
+    for validated instance segmentation of overlapping physical fragments.
     """
-    if not detail:
-        clean = remove_small_objects(mask.astype(bool), min_size=18)
-        clean = cv2.morphologyEx(clean.astype(np.uint8), cv2.MORPH_OPEN,
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))) > 0
-        dist = ndi.gaussian_filter(ndi.distance_transform_edt(clean), 1.4)
-        seeds = h_maxima(dist, h=2.5) & (dist >= 3.2)
-        _, markers = cv2.connectedComponents(seeds.astype(np.uint8), 8)
-        if markers.max() < 1:
-            _, labels = cv2.connectedComponents(clean.astype(np.uint8), 8)
-        else:
-            labels = watershed(-dist, markers, mask=clean)
-        min_area = 26
-    else:
-        clean = remove_small_objects(mask.astype(bool), min_size=5)
-        if not clean.any():
-            return np.zeros(mask.shape, np.int32), np.array([], dtype=float)
-        dist = ndi.gaussian_filter(ndi.distance_transform_edt(clean).astype(np.float32), 0.8)
-        lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
-        lum = ndi.gaussian_filter(lab[:, :, 0].astype(np.float32)/255., 1.0)
-        a = ndi.gaussian_filter(lab[:, :, 1].astype(np.float32)/255., 1.0)
-        b = ndi.gaussian_filter(lab[:, :, 2].astype(np.float32)/255., 1.0)
-        gradient = .45 * sobel(lum) + .30 * sobel(a) + .25 * sobel(b)
-        gradient = np.clip(gradient / max(float(np.quantile(gradient[clean], .95)), 1e-6), 0, 1)
-        shape_peaks = peak_local_max(dist, min_distance=8, threshold_abs=1.8,
-            labels=clean.astype(np.uint8), exclude_border=False, num_peaks=1800)
-        texture_peaks = peak_local_max(lum, min_distance=11, threshold_rel=.08,
-            labels=clean.astype(np.uint8), exclude_border=False, num_peaks=900)
-        points = [(int(y),int(x)) for y,x in shape_peaks]
-        taken = np.zeros(clean.shape, np.uint8)
-        for y,x in points:
-            cv2.circle(taken, (x,y), 7, 255, -1)
-        for y,x in texture_peaks:
-            y,x = int(y),int(x)
-            if dist[y,x] < 2 or taken[y,x]:
-                continue
-            local = lum[max(0,y-10):y+11, max(0,x-10):x+11]
-            if lum[y,x] - np.percentile(local,30) < .055:
-                continue
-            points.append((y,x))
-            cv2.circle(taken, (x,y), 8, 255, -1)
-        markers = np.zeros(clean.shape, np.int32)
-        for i,(y,x) in enumerate(points,1):
-            markers[y,x] = i
-        # Assign at least one marker to each disconnected visible component.
-        # This avoids losing small material islands simply because they have
-        # no strong distance or texture peak.
-        n, components = cv2.connectedComponents(clean.astype(np.uint8),8)
-        for i in range(1,n):
-            local_mask = components == i
-            if not np.any(markers[local_mask]):
-                ys,xs = np.where(local_mask)
-                idx = int(np.argmax(dist[local_mask]))
-                markers[ys[idx],xs[idx]] = len(points) + i
-        elevation = .65 * gradient + .35 * (1 - dist/(np.percentile(dist[clean],95)+.1))
-        labels = watershed(elevation, markers, mask=clean)
-        min_area = 7
-    retained = [p for p in regionprops(labels) if p.area >= min_area]
-    lut = np.zeros(int(labels.max())+1,np.int32)
-    for i,p in enumerate(retained,1):
-        lut[p.label] = i
-    labels = lut[labels]
-    return labels, np.array([r.area for r in regionprops(labels)],dtype=np.float64)
+    clean = remove_small_objects(mask.astype(bool), min_size=5)
+    if not clean.any():
+        return np.zeros(mask.shape, np.int32), np.array([], dtype=float)
+
+    ys, xs = np.where(clean)
+    pad = 5
+    y0 = max(0, int(ys.min()) - pad)
+    y1 = min(clean.shape[0], int(ys.max()) + pad + 1)
+    x0 = max(0, int(xs.min()) - pad)
+    x1 = min(clean.shape[1], int(xs.max()) + pad + 1)
+    crop = rgb[y0:y1, x0:x1]
+    inside = clean[y0:y1, x0:x1]
+
+    # Pixel-affinity graph on LAB color: change in appearance, not arbitrary
+    # local-maxima seed placement, determines where boundaries are proposed.
+    lab = cv2.cvtColor(crop, cv2.COLOR_RGB2LAB).astype(np.float32) / 255.0
+    scale = 300 if detail else 600
+    min_component = 15 if detail else 32
+    raw = felzenszwalb(lab, scale=scale, sigma=0.7,
+                       min_size=28 if detail else 55, channel_axis=-1).astype(np.int32) + 1
+    raw[~inside] = 0
+    # A single appearance segment can become disconnected after removing metal.
+    # Label its connected components independently so reported regions are contiguous.
+    from skimage.measure import label as connected_label
+    components = connected_label(raw, connectivity=1, background=0).astype(np.int32)
+    sizes = np.bincount(components.ravel())
+    keep = sizes >= min_component
+    keep[0] = False
+    components[~keep[components]] = 0
+    # Produce consecutive IDs used consistently by the overlays and CSV.
+    unique, inv = np.unique(components, return_inverse=True)
+    labels_roi = inv.reshape(components.shape).astype(np.int32)
+    labels_roi[components == 0] = 0
+    final = np.zeros(mask.shape, dtype=np.int32)
+    final[y0:y1, x0:x1] = labels_roi
+    areas = np.array([r.area for r in regionprops(final)], dtype=np.float64)
+    return final, areas
 
 
 def outline_region_overlay(result: dict, conservative: bool = False) -> np.ndarray:
@@ -308,7 +283,7 @@ def visual_overlay(r: dict) -> np.ndarray:
 
 
 def colored_region_overlay(result: dict, show_numbers: bool = True, conservative: bool = False) -> np.ndarray:
-    """Display individual watershed candidate regions with stable ID labels."""
+    """Display individual graph-based appearance segmentation candidate regions with stable ID labels."""
     rgb = result['rgb'].copy()
     labels = result['coarse_labels'] if conservative else result['labels']
     count = int(labels.max())
@@ -522,7 +497,7 @@ def make_export(w: dict, d: dict, shared_scale: float | None, report: dict, regi
 
 st.set_page_config(page_title='DryMatter Vision | Four Measures', page_icon='🔬', layout='wide')
 st.title('DryMatter Vision')
-st.caption('Automatic material mask · mean area reduction · color quality control · edge-assisted region maps and multi-view distributions')
+st.caption('Automatic material mask · mean area reduction · color quality control · graph-based region boundaries and multi-view distributions')
 with st.sidebar:
     st.header('Upload photographs')
     wet_file = st.file_uploader('Wet / Before', type=['jpg','jpeg','png','webp','tif','tiff'], key='wet')
@@ -599,7 +574,7 @@ with mask_tab:
     st.info('Mask quality is crucial: reflective metal, shadows, and brown staining may be misclassified. Check both overlays before interpreting results.')
 
 with area_tab:
-    st.subheader('Mean candidate-region area reduction')
+    st.subheader('Mean graph-region area change (exploratory)')
     st.latex(r'\bar A_{wet}=\frac{\sum_{i=1}^{N_{wet}} A_{i,wet}}{N_{wet}}')
     st.latex(r'\bar A_{dry}=\frac{\sum_{j=1}^{N_{dry}} A_{j,dry}}{N_{dry}}')
     st.latex(r'S_{mean}(\%)=\frac{\bar A_{wet}-\bar A_{dry}}{\bar A_{wet}}\times100')
@@ -612,7 +587,7 @@ with area_tab:
         dict(Condition='Dry', Candidate_regions=nd, Mean_region_area=mean_d, Total_material_area=material_d),
     ]), hide_index=True, use_container_width=True)
     st.caption(f'Area units above: {unit}. Total mask area reduction (separate statistic): {area_reduction:+.1f}%.')
-    st.warning('Mean area depends strongly on how touching fragments are split. This is a candidate-region statistic, not verified individual particle or volume shrinkage. Negative values are never overwritten.')
+    st.warning('These graph regions are appearance patches, not validated individual particles. The mean depends on segmentation scale and does NOT establish physical shrinkage. Negative values are never overwritten.')
 
 with color_tab:
     st.subheader('Quality control — color change')
@@ -632,8 +607,8 @@ with color_tab:
 regions = region_measurements(w, d, mm)
 area_column = 'Area (mm²)' if mm is not None else 'Area (px²)'
 with particle_tab:
-    st.subheader('Detailed candidate-region map')
-    st.caption('Texture-and-shape-assisted segmentation retains more candidate fragments. Every colored patch is a candidate, not a verified particle. Stacked or touching pieces can remain merged; some textured pieces can split.')
+    st.subheader('Graph-based candidate appearance regions')
+    st.caption('Graph-based segmentation groups adjacent pixels with similar LAB color and texture. Each region is an appearance patch, NOT necessarily one physical particle. Overlapping pieces can merge, and one textured piece can split.')
     wet_col, dry_col = st.columns(2)
     with wet_col:
         st.markdown(f'**WET — {nw} regions**')
@@ -642,20 +617,20 @@ with particle_tab:
         st.markdown(f'**DRY — {nd} regions**')
         st.image(colored_region_overlay(d), use_container_width=True)
     st.subheader('Boundaries on the original photographs')
-    st.caption('Pink lines show candidate region boundaries without hiding the original material. Inspect these first to find merges or artificial splits.')
+    st.caption('Pink lines follow unsupervised appearance boundaries. Inspect the original texture: lines may split one particle or merge touching particles.')
     oc1,oc2=st.columns(2)
     oc1.image(outline_region_overlay(w), use_container_width=True)
     oc2.image(outline_region_overlay(d), use_container_width=True)
-    st.subheader('Algorithm sensitivity — detailed versus conservative')
+    st.subheader('Algorithm sensitivity — fine versus coarse graph segments')
     st.dataframe(pd.DataFrame([
-        {'Condition':'Wet','Detailed regions':nw,'Conservative regions':int(w['coarse_labels'].max())},
-        {'Condition':'Dry','Detailed regions':nd,'Conservative regions':int(d['coarse_labels'].max())},
+        {'Condition':'Wet','Fine graph regions':nw,'Coarse graph regions':int(w['coarse_labels'].max())},
+        {'Condition':'Dry','Fine graph regions':nd,'Coarse graph regions':int(d['coarse_labels'].max())},
     ]),hide_index=True,use_container_width=True)
-    with st.expander('See conservative segmentation maps (fewer splits)'):
+    with st.expander('See coarse graph-segmentation maps (fewer splits)'):
         cc1, cc2 = st.columns(2)
         cc1.image(colored_region_overlay(w, conservative=True), use_container_width=True)
         cc2.image(colored_region_overlay(d, conservative=True), use_container_width=True)
-    st.warning('The gap between detailed and conservative region counts measures sensitivity to segmentation settings. It is not a confidence interval. Overlapping hidden fragments cannot be counted reliably from one overhead photograph.')
+    st.warning('The gap between fine and coarse graph region counts measures sensitivity to the appearance-segmentation settings. It is not a confidence interval. Overlapping hidden fragments cannot be counted reliably from one overhead photograph.')
     st.subheader('Region area distribution')
     st.pyplot(distribution_figure(regions, area_column), use_container_width=True)
     st.caption('Number-based histogram: the height of a bin counts candidate regions in that area range. Values above the 99th percentile are included in the final bin for display; CSV retains exact values.')
@@ -691,7 +666,7 @@ report = {
     'delta_Lab': delta_lab.tolist(),
     'size_class_distribution': class_counts(regions).to_dict(orient='records'),
     'sensitivity': {'wet_conservative_count': int(w['coarse_labels'].max()), 'dry_conservative_count': int(d['coarse_labels'].max())},
-    'limitation':'2D camera masks; watershed candidates are not verified physical particles. Overlaps remain unresolved; more detailed splitting is not proof of correctness. No 3D volume shrinkage is inferred.'
+    'limitation':'2D camera masks; graph-based appearance patches are not verified physical particles. Overlaps remain unresolved; more detailed splitting is not proof of correctness. No 3D volume shrinkage is inferred.'
 }
 st.download_button('Download masks, numbered regions, distributions and report (ZIP)',
                    make_export(w,d,mm,report,regions), file_name='DryMatter_Vision_Results.zip',
