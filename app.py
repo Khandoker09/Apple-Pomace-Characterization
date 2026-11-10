@@ -46,12 +46,23 @@ LINE='#DCE5EC'
 SMALL, MEDIUM, LARGE='#2987EF','#13B89B','#E14D98'
 CLASS_RGB={'Small':(41,135,239),'Medium':(19,184,155),'Large':(225,77,152)}
 
+# Maximum disagreement allowed between the wet and dry ruler calibrations.
+# Both photos should come from the same camera setup, so a larger mismatch
+# means at least one calibration is wrong.
+CALIBRATION_TOLERANCE = .15
 
-def read_uploaded(data:bytes,max_side:int=1150)->tuple[np.ndarray,float|None,str]:
+
+def read_uploaded(data:bytes,max_side:int=1150,manual_mm_per_px:float|None=None)->tuple[np.ndarray,float|None,str]:
+    """Load an image, shrink it to max_side, and calibrate it.
+
+    manual_mm_per_px refers to the RESIZED image (the one shown in the app).
+    """
     with Image.open(io.BytesIO(data)) as im:
         im=ImageOps.exif_transpose(im).convert('RGB')
         im.thumbnail((max_side,max_side),Image.Resampling.LANCZOS)
         rgb=np.asarray(im).copy()
+    if manual_mm_per_px is not None and manual_mm_per_px>0:
+        return rgb,float(manual_mm_per_px),f'Manual scale: {manual_mm_per_px:.5f} mm/px.'
     mm,msg=auto_ruler(rgb)
     return rgb,mm,msg
 
@@ -61,6 +72,11 @@ def _ruler_stripe_candidates(gray: np.ndarray, orientation: str) -> list[tuple]:
     The scanner finds repeated fine/medium/long tick lines; it does NOT use
     handwritten guesses about the ruler's cm-label positions.  Rotating the
     image before calling this also supports horizontal rulers.
+
+    A true 1-mm lattice also correlates at 2, 3, 4, 5 and 10 mm. After scoring
+    all periods, the smallest period that scores nearly as well as the best one
+    is therefore preferred (octave correction), so the scale is not
+    overestimated by a whole-number factor.
     """
     from scipy.ndimage import gaussian_filter1d
     from scipy.signal import correlate
@@ -106,18 +122,33 @@ def _ruler_stripe_candidates(gray: np.ndarray, orientation: str) -> list[tuple]:
                     return -1.
                 return float(np.max(ac[at-1:at+2]))
 
-            best = (-1., 0.)
+            # Score every plausible period first, then pick.
+            scored: dict[float, float] = {}
             for q in np.arange(low_q, high_q, .10):
                 scores = [strength(q,k) for k in (1, 2, 3, 4, 5, 6, 8, 10)]
                 if scores[4] < .38 or scores[7] < .38:
                     continue
-                score = (scores[0]*.10 + scores[1]*.10 + scores[2]*.10 +
-                         scores[3]*.05 + scores[4]*.23 + scores[5]*.07 +
-                         scores[6]*.05 + scores[7]*.30)
-                if score > best[0]:
-                    best = (score, float(q))
-            if best[0] >= .66:
-                candidates.append((best[0], best[1], x, ya, orientation))
+                scored[round(float(q), 2)] = (
+                    scores[0]*.10 + scores[1]*.10 + scores[2]*.10 +
+                    scores[3]*.05 + scores[4]*.23 + scores[5]*.07 +
+                    scores[6]*.05 + scores[7]*.30)
+            if not scored:
+                continue
+            q_best, s_best = max(scored.items(), key=lambda kv: kv[1])
+            s_best_val = s_best
+
+            # Octave correction: prefer the finest period that is almost as good.
+            for div in (10, 5, 4, 3, 2):
+                target = q_best / div
+                if target < low_q - .15:
+                    continue
+                near = [(s, q) for q, s in scored.items()
+                        if abs(q - target) <= max(.15, .04*target)]
+                if near and max(near)[0] >= s_best_val - .10:
+                    s_best_val, q_best = max(near)
+                    break
+            if s_best_val >= .66:
+                candidates.append((s_best_val, float(q_best), x, ya, orientation))
     return candidates
 
 
@@ -129,7 +160,7 @@ def auto_ruler(rgb: np.ndarray) -> tuple[float | None, str]:
     """
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
     candidates = _ruler_stripe_candidates(gray, 'vertical')
-    candidates += _ruler_stripe_candidates(np.rot90(gray), 'horizontal')
+    candidates += _ruler_stripe_candidates(np.ascontiguousarray(np.rot90(gray)), 'horizontal')
     if not candidates:
         return None, 'Could not validate regularly spaced metric ruler ticks; reporting pixels.'
 
@@ -151,6 +182,17 @@ def auto_ruler(rgb: np.ndarray) -> tuple[float | None, str]:
     return mm_per_px, (f'Metric ruler validated automatically ({best[4]}): '
                        f'1 mm ≈ {q:.2f} px; 10 mm ≈ {q*10:.1f} px; '
                        f'{mm_per_px:.5f} mm/px, {distinct_stripes} agreeing scanlines.')
+
+
+def reconcile_calibrations(wm: float | None, dm: float | None,
+                           wmsg: str, dmsg: str) -> tuple[float | None, float | None, str, str]:
+    """Wet and dry photos should share one camera setup; reject inconsistent scales."""
+    if wm is not None and dm is not None and abs(wm/dm - 1) > CALIBRATION_TOLERANCE:
+        note = (f' REJECTED: wet scale ({wm:.5f} mm/px) and dry scale ({dm:.5f} mm/px) '
+                f'differ by more than {CALIBRATION_TOLERANCE*100:.0f}%. '
+                'Use the manual scale override in the sidebar or retake the photos from the same distance.')
+        return None, None, wmsg + note, dmsg + note
+    return wm, dm, wmsg, dmsg
 
 
 def material_mask(rgb: np.ndarray, bounds: tuple[float, float, float, float] | None = None):
@@ -245,6 +287,29 @@ def material_mask(rgb: np.ndarray, bounds: tuple[float, float, float, float] | N
     foreground=(silhouette>0)&(sat>=35)&(val>=25)
     if foreground.sum() < max(200,ph*pw*.005):
         raise ValueError('Too few material pixels detected automatically; check illumination and background.')
+
+    # Build the footprint from the CLEANED material mask, not the raw GrabCut
+    # silhouette. The raw silhouette can leak onto a neighbouring ruler or tray
+    # wall, which would inflate footprint area and footprint reduction.
+    close_k = max(9, int(min(ph, pw)*.06) | 1)
+    fp = cv2.morphologyEx(foreground.astype(np.uint8), cv2.MORPH_CLOSE,
+                          cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k, close_k)))
+    fp = ndi.binary_fill_holes(fp).astype(np.uint8)
+    # An opening cuts thin bridges to attached objects such as a ruler edge.
+    open_k = max(7, int(min(ph, pw)*.03) | 1)
+    fp_open = cv2.morphologyEx(fp, cv2.MORPH_OPEN,
+                               cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_k, open_k)))
+    if fp_open.sum() > 0:
+        fp = fp_open
+    n_fp, lab_fp, st_fp, _ = cv2.connectedComponentsWithStats(fp, 8)
+    if n_fp > 1:
+        fp = (lab_fp == 1 + int(np.argmax(st_fp[1:, cv2.CC_STAT_AREA]))).astype(np.uint8)
+    if fp.sum() < max(200, ph*pw*.005):
+        fp = silhouette.copy()  # safety fallback
+    silhouette = fp
+    # Material pixels must also lie within the cleaned footprint.
+    foreground = foreground & (silhouette > 0)
+
     mask=np.zeros((h,w),bool); footprint=np.zeros((h,w),bool)
     mask[y0:y1,x0:x1]=foreground
     footprint[y0:y1,x0:x1]=silhouette>0
@@ -588,6 +653,11 @@ with st.sidebar:
     st.header('Analyze samples')
     wet_file=st.file_uploader('Wet / Before',type=['png','jpg','jpeg','webp','tif','tiff'],key='wet')
     dry_file=st.file_uploader('Dry / After',type=['png','jpg','jpeg','webp','tif','tiff'],key='dry')
+    manual_scale=st.number_input('Manual scale override (mm per pixel, 0 = automatic ruler)',
+                                 min_value=0.0,value=0.0,step=0.001,format='%.5f',
+                                 help='Refers to the image as shown in the app (longest side resized to 1150 px). '
+                                      'Applied to BOTH photos; use it only if both were taken from the same distance. '
+                                      'Example: if 10 mm spans 57 px, enter 10/57 = 0.17544.')
     analyze=st.button('Analyze images',type='primary',width="stretch",disabled=wet_file is None or dry_file is None)
     st.caption('Automatic processing: sample detection and ruler reading. For comparable measurements, use straight overhead photos, even lighting and a visible ruler in both images.')
     st.divider()
@@ -596,9 +666,11 @@ with st.sidebar:
 if analyze:
     try:
         with st.spinner('Finding material, calibrating rulers, and segmenting visible regions…'):
-            wr,wm,wmsg=read_uploaded(wet_file.getvalue())
-            dr,dm,dmsg=read_uploaded(dry_file.getvalue())
-            # Fully automatic: material selection and scale detection use image evidence only.
+            override=manual_scale if manual_scale>0 else None
+            wr,wm,wmsg=read_uploaded(wet_file.getvalue(),manual_mm_per_px=override)
+            dr,dm,dmsg=read_uploaded(dry_file.getvalue(),manual_mm_per_px=override)
+            # Wet and dry share one camera setup, so inconsistent scales are rejected.
+            wm,dm,wmsg,dmsg=reconcile_calibrations(wm,dm,wmsg,dmsg)
             wet=detect_regions(wr,wm)
             dry=detect_regions(dr,dm)
             cuts=assign_classes(wet,dry)
@@ -635,7 +707,7 @@ c2.metric('Dry candidate regions',len(dry['features']))
 c3.metric('Mean color difference ΔE*76',f'{np.linalg.norm(wet["mean_lab"]-dry["mean_lab"]):.2f}')
 c4.metric('2D area reduction', (f"{change_metrics(wet,dry)['apparent_colored_area_reduction_pct']:+.1f}%" if change_metrics(wet,dry)['comparable'] else 'Not calibrated'),help='Apparent change in segmented colored pixels after mm calibration—not true shrinkage.')
 if wet['unit']!='mm':
-    st.warning('Automatic ruler calibration was not validated in BOTH images. Measurements are in pixels. '+res['wet_msg']+' '+res['dry_msg'])
+    st.warning('Calibration was not validated in BOTH images. Measurements are in pixels. '+res['wet_msg']+' '+res['dry_msg'])
 else:
     st.caption('Wet: '+res['wet_msg']+'   |   Dry: '+res['dry_msg'])
 st.markdown('<div class="info-box">Contours are <b>candidate 2D image regions</b>, not verified separate physical particles. Review the material mask before using counts or areas. Projected-area changes do not measure true volume shrinkage.</div>',unsafe_allow_html=True)
@@ -692,7 +764,7 @@ with tabs[4]:
     st.subheader('Apparent 2D change — not true volume shrinkage')
     change=change_metrics(wet,dry)
     if not change['comparable']:
-        st.warning('Cannot provide a defensible shrinkage percentage: valid ruler calibration is required in BOTH photographs. Upload both calibrated images and rerun.')
+        st.warning('Cannot provide a defensible shrinkage percentage: valid ruler calibration is required in BOTH photographs. Upload both calibrated images and rerun, or enter a manual scale in the sidebar.')
     else:
         def display_change(value):
             return 'Not available' if value is None else f'{value:+.1f}%'
