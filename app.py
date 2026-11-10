@@ -1,18 +1,16 @@
-"""DryMatter Vision | Streamlit Community Cloud edition.
-Single-file analysis app; pair with requirements.txt for deployment.
+"""DryMatter Vision: three analyses only.
+1. Automatic tray-guided material mask
+2. Mean candidate-region area reduction
+3. Camera-based CIELAB colour change
 
-Research caution: numbered regions are candidate 2D image patches, not validated
-physical particles. Automatic tray and ruler detection still require visual review.
+Research limitation: watershed regions are not validated physical particles.
+Top-down photos do not measure thickness or volume.
 """
 from __future__ import annotations
-import colorsys
 import io
 import json
-import math
 import zipfile
 from datetime import datetime, timezone
-from pathlib import Path
-
 import cv2
 import numpy as np
 import pandas as pd
@@ -23,29 +21,7 @@ from scipy.signal import find_peaks
 from skimage.feature import peak_local_max
 from skimage.filters import sobel
 from skimage.measure import regionprops
-from skimage.morphology import skeletonize
 from skimage.segmentation import watershed
-from matplotlib.figure import Figure
-
-TITLE='DryMatter Vision'
-CREDIT = '''Maintained by Khandoker Tanjim Ahammad
-Doctoral Researcher
-University of Hohenheim
-Institute of Agricultural Engineering
-Agricultural Engineering in the Tropics and Subtropics
-
-'''
-
-DARK='#172C3A'
-BG='#EFF3F7'
-PANEL='#FFFFFF'
-MUTED='#657787'
-TEAL='#007F90'
-ORANGE='#C66A34'
-LINE='#DCE5EC'
-SMALL, MEDIUM, LARGE='#2987EF','#13B89B','#E14D98'
-CLASS_RGB={'Small':(41,135,239),'Medium':(19,184,155),'Large':(225,77,152)}
-
 
 def read_uploaded(data:bytes,max_side:int=1150)->tuple[np.ndarray,float|None,str]:
     with Image.open(io.BytesIO(data)) as im:
@@ -94,7 +70,6 @@ def detect_ruler_box(gray: np.ndarray) -> tuple[int, int, int, int] | None:
     else:
         y0, y1 = int(ys[0]), int(ys[-1])
     return xl, xr, y0, y1
-
 
 def auto_ruler(rgb: np.ndarray) -> tuple[float | None, str]:
     """Automatic metric ruler calibration using repeated 1 mm ticks."""
@@ -165,7 +140,6 @@ def detect_tray_circle(rgb: np.ndarray) -> tuple[int, int, int] | None:
             best = (int(x), int(y), int(r))
     return best
 
-
 def material_mask(rgb: np.ndarray):
     """Automatic material-only mask inside the detected tray; preserve open gaps.
 
@@ -218,510 +192,208 @@ def material_mask(rgb: np.ndarray):
     # roi denotes the observable tray INTERIOR, not a filled material footprint.
     return foreground, interior, info
 
-def material_overlay(result: dict) -> np.ndarray:
-    """QC view: GREEN = accepted material, MAGENTA = detected material edge."""
-    rgb = result['rgb'].copy()
-    mask = result['mask']
-    rgb[mask] = np.clip(.55*rgb[mask].astype(float) +
-                        .45*np.array([33, 211, 140]),0,255).astype(np.uint8)
-    outline = cv2.morphologyEx(np.uint8(result['mask'])*255,
-                  cv2.MORPH_GRADIENT,np.ones((3,3),np.uint8))>0
-    rgb[outline] = (225, 55, 170)
-    return rgb
 
-
-def detect_regions(rgb: np.ndarray, mm: float|None) -> dict:
-    fg,roi,info=material_mask(rgb)
-    if fg.sum()<300:
-        raise ValueError('The colored sample was not identified. Use a clear overhead photo in a contrasting tray.')
-    hsv=cv2.cvtColor(rgb,cv2.COLOR_RGB2HSV)
-    lab=cv2.cvtColor(rgb,cv2.COLOR_RGB2LAB)
-    luminous=ndi.gaussian_filter(lab[:,:,0].astype(np.float32)/255.,1.3)
-    chroma=ndi.gaussian_filter(hsv[:,:,1].astype(np.float32)/255.,1.2)
-    # Conservative image-based candidate segmentation, not physical particle
-    # instance segmentation. Gradient watershed splits connected material.
-    spacing=int(np.clip(min(rgb.shape[:2])/76,6,15))
-    seeds=peak_local_max(luminous,min_distance=spacing,threshold_rel=.025,
-                         labels=fg.astype(np.uint8),exclude_border=False,num_peaks=2200)
-    markers=np.zeros(fg.shape,np.int32)
-    if len(seeds):
-        markers[seeds[:,0],seeds[:,1]]=np.arange(1,len(seeds)+1,dtype=np.int32)
-        gradient=.76*sobel(luminous)+.24*sobel(chroma)
-        labels=watershed(gradient,markers,mask=fg).astype(np.int32)
+def segmentation(rgb: np.ndarray, mask: np.ndarray):
+    """Gradient watershed: candidate image patches, NOT tracked physical particles."""
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    lum = ndi.gaussian_filter(lab[:, :, 0].astype(np.float32) / 255.0, 1.3)
+    sat = ndi.gaussian_filter(hsv[:, :, 1].astype(np.float32) / 255.0, 1.2)
+    spacing = int(np.clip(min(rgb.shape[:2]) / 76, 6, 15))
+    peaks = peak_local_max(lum, min_distance=spacing, threshold_rel=0.025,
+                           labels=mask.astype(np.uint8), exclude_border=False,
+                           num_peaks=2200)
+    markers = np.zeros(mask.shape, np.int32)
+    if len(peaks):
+        markers[peaks[:, 0], peaks[:, 1]] = np.arange(1, len(peaks) + 1, dtype=np.int32)
+        gradient = 0.76 * sobel(lum) + 0.24 * sobel(sat)
+        labels = watershed(gradient, markers, mask=mask).astype(np.int32)
     else:
-        _,labels=cv2.connectedComponents(fg.astype(np.uint8),8)
-    smallest=max(10,int(fg.size*.000018))
-    picked=[p for p in regionprops(labels) if p.area>=smallest]
-    # Relabel densely from 1; the on-image numbers correspond exactly to CSV.
-    translation=np.zeros(labels.max()+1,np.int32)
-    for i,p in enumerate(picked,1):translation[p.label]=i
-    labels=translation[labels]
-    props=regionprops(labels)
-    factor=mm if mm is not None else 1.0
-    records=[]
-    for p in props:
-        top,left,bottom,right=p.bbox
-        m=(labels[top:bottom,left:right]==p.label)
-        dist=ndi.distance_transform_edt(m)
-        ridge=skeletonize(m)
-        local=2*dist[ridge]
-        area=int(p.area)
-        length=float(p.axis_major_length)
-        width=float(p.axis_minor_length)
-        eq=math.sqrt(4*area/math.pi)
-        records.append({
-            'id':int(p.label),'x':float(p.centroid[1]),'y':float(p.centroid[0]),
-            'area_px2':area,'area':area*factor**2,
-            'length_px':length,'width_px':width,'eq_diameter_px':eq,
-            'length':length*factor,'width':width*factor,
-            'eq_diameter':eq*factor,
-            'local_width':float(np.median(local))*factor if local.size else 0.,
-            'perimeter':float(p.perimeter)*factor,
-            'circularity':min(1.,4*math.pi*area/(p.perimeter*p.perimeter)) if p.perimeter else 0.,
-            'class':'Unclassified',
-        })
-    L=lab[:,:,0].astype(float)*100/255
-    A=lab[:,:,1].astype(float)-128
-    B=lab[:,:,2].astype(float)-128
-    mean_lab=np.array([L[fg].mean(),A[fg].mean(),B[fg].mean()])
-    hues,sats=hsv[:,:,0],hsv[:,:,1]
-    red=fg&(hues<13)&(sats>95)
-    dark=fg&(L<57)&~red
-    pale=fg&(L>71)&~red
-    middle=fg&~red&~dark&~pale
-    denom=max(1,int(fg.sum()))
-    groups={'Red-toned':100*red.sum()/denom,'Dark-toned':100*dark.sum()/denom,
-            'Light-toned':100*pale.sum()/denom,'Mid-toned':100*middle.sum()/denom}
-    return {'rgb':rgb,'roi':roi,'roi_info':info,'mask':fg,
-            'labels':labels,'features':records,'mm_per_px':mm,
-            'unit':'mm' if mm is not None else 'px',
-            'area_unit':'mm²' if mm is not None else 'px²',
-            'colored_area':float(fg.sum())*factor**2,
-            'footprint_area':float(roi.sum())*factor**2,
-            'tray_coverage_pct': float(fg.sum())/max(1,int(roi.sum()))*100,
-            'visible_empty_pct': 100-float(fg.sum())/max(1,int(roi.sum()))*100,
-            'mean_lab':mean_lab,'composition':groups,
-            'L_sample':L[fg][::max(1,int(fg.sum()//13000))]}
+        _, labels = cv2.connectedComponents(mask.astype(np.uint8), 8)
+    minimum_area = max(10, int(mask.size * 0.000018))
+    props = [p for p in regionprops(labels) if p.area >= minimum_area]
+    compact = np.zeros(int(labels.max()) + 1, dtype=np.int32)
+    for i, p in enumerate(props, start=1):
+        compact[p.label] = i
+    labels = compact[labels]
+    return labels, np.array([p.area for p in props], dtype=np.float64)
 
 
-def apply_mm_scale(result: dict, mm_per_px: float) -> None:
-    """Apply or refresh physical scaling from stored pixel measurements."""
-    for p in result['features']:
-        p['area'] = p['area_px2'] * mm_per_px ** 2
-        p['length'] = p['length_px'] * mm_per_px
-        p['width'] = p['width_px'] * mm_per_px
-        p['eq_diameter'] = p['eq_diameter_px'] * mm_per_px
-        p['local_width'] = (p['local_width'] / max(result.get('mm_per_px') or 1.0, 1e-12)
-                            if result['unit'] == 'mm' and result.get('mm_per_px') else p['local_width'])
-        p['local_width'] = p['local_width'] * mm_per_px
-        p['perimeter'] = (p['perimeter'] / max(result.get('mm_per_px') or 1.0, 1e-12)
-                          if result['unit'] == 'mm' and result.get('mm_per_px') else p['perimeter'])
-        p['perimeter'] = p['perimeter'] * mm_per_px
-    result['colored_area'] = float(result['mask'].sum()) * mm_per_px ** 2
-    result['footprint_area'] = float(result['roi'].sum()) * mm_per_px ** 2
-    result['mm_per_px'] = mm_per_px
-    result['unit'] = 'mm'
-    result['area_unit'] = 'mm²'
+def analyze(rgb: np.ndarray, mm_per_px: float | None) -> dict:
+    material, tray, details = material_mask(rgb)
+    labels, areas_px2 = segmentation(rgb, material)
+    lab_cv = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+    # OpenCV's uint8 Lab requires conversion: L*=L_cv*100/255, a*=a_cv-128, b*=b_cv-128
+    mean_lab = np.array([
+        lab_cv[:, :, 0][material].mean() * 100 / 255,
+        lab_cv[:, :, 1][material].mean() - 128,
+        lab_cv[:, :, 2][material].mean() - 128,
+    ], dtype=float)
+    return dict(rgb=rgb, mask=material, tray=tray, info=details, labels=labels,
+                region_px2=areas_px2, mm_per_px=mm_per_px, lab=mean_lab)
 
 
-def assign_classes(wet: dict,dry: dict)->tuple[float,float]:
-    """Classify visible candidate regions and harmonize pair calibration."""
-    same_shape = wet['rgb'].shape[:2] == dry['rgb'].shape[:2]
-    # If one image calibrates and the other does not, reuse the pair scale when both
-    # photos were captured at the same size. This matches the intended imaging setup.
-    if wet['mm_per_px'] is None and dry['mm_per_px'] is not None and same_shape:
-        apply_mm_scale(wet, dry['mm_per_px'])
-    elif dry['mm_per_px'] is None and wet['mm_per_px'] is not None and same_shape:
-        apply_mm_scale(dry, wet['mm_per_px'])
-    elif wet['mm_per_px'] is not None and dry['mm_per_px'] is not None:
-        rel = abs(wet['mm_per_px'] - dry['mm_per_px']) / max(wet['mm_per_px'], dry['mm_per_px'])
-        if rel <= 0.08:
-            shared = float((wet['mm_per_px'] + dry['mm_per_px']) / 2.0)
-            apply_mm_scale(wet, shared)
-            apply_mm_scale(dry, shared)
-        else:
-            # Different ruler scales may mean the images were taken at different
-            # camera distances. Preserve independent calibration; do not average.
-            pass
-    values=[p['eq_diameter'] for r in (wet,dry) for p in r['features']]
-    if len(values)>=3:
-        cuts=tuple(map(float,np.percentile(values,[33.33,66.67])))
-    else:cuts=(2.,5.)
-    for r in (wet,dry):
-        for p in r['features']:
-            d=p['eq_diameter']
-            p['class']='Small' if d<cuts[0] else ('Medium' if d<cuts[1] else 'Large')
-    return cuts
-
-def region_color(i: int) -> tuple[int,int,int]:
-    # Golden-angle hue progression gives a variety of distinguishable hues.
-    h=(i*.61803398875+.13)%1.
-    r,g,b=colorsys.hsv_to_rgb(h,.83,.96)
-    return int(r*255),int(g*255),int(b*255)
+def visual_overlay(r: dict) -> np.ndarray:
+    img = r['rgb'].copy()
+    img[r['mask']] = np.clip(img[r['mask']].astype(float) * .55 +
+                             np.array([33, 211, 140]) * .45, 0, 255).astype(np.uint8)
+    # Outlines the material (including exposed gaps), NOT the whole tray boundary.
+    edge = cv2.morphologyEx(r['mask'].astype(np.uint8) * 255,
+                            cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8)) > 0
+    img[edge] = (230, 50, 170)
+    return img
 
 
-def segmentation_overlay(result:dict,mode='rainbow',numbers=True)->np.ndarray:
-    src=result['rgb'].copy(); lab=result['labels']
-    active=lab>0
-    if lab.max()<1:return src
-    # Full distinct-color instance overlay; class view uses constant palette.
-    lut=np.zeros((int(lab.max())+1,3),np.uint8)
-    class_by_id={p['id']:p['class'] for p in result['features']}
-    for i in range(1,len(lut)):
-        lut[i]=region_color(i) if mode=='rainbow' else CLASS_RGB.get(class_by_id[i], (140,140,140))
-    painted=lut[lab]
-    src[active]=np.clip(.24*src[active].astype(float)+.76*painted[active],0,255).astype(np.uint8)
-    # Only draw boundaries inside foreground. We never outline the metal rim.
-    border=np.zeros(lab.shape,bool)
-    border[1:,:] |= ((lab[1:,:]!=lab[:-1,:]) & active[1:,:])
-    border[:,1:] |= ((lab[:,1:]!=lab[:,:-1]) & active[:,1:])
-    src[border]=(12,31,43)
-    if numbers:
-        for p in result['features']:
-            x,y=int(round(p['x'])),int(round(p['y']))
-            # Numeric labels correspond exactly to the particle table. Tiny
-            # regions are still indexed, though text may overlap when zoomed out.
-            text=str(p['id']);font=cv2.FONT_HERSHEY_SIMPLEX
-            size=.30 if src.shape[1]<=750 else .42
-            (tw,th),_=cv2.getTextSize(text,font,size,1)
-            x0=x-tw//2;y0=y+th//2
-            cv2.putText(src,text,(x0,y0),font,size,(16,26,36),2,cv2.LINE_AA)
-            cv2.putText(src,text,(x0,y0),font,size,(255,255,255),1,cv2.LINE_AA)
-    return src
+def png(rgb: np.ndarray) -> bytes:
+    out = io.BytesIO()
+    Image.fromarray(rgb.astype(np.uint8)).save(out, format='PNG')
+    return out.getvalue()
 
 
-def clean_axis(ax):
-    ax.spines['top'].set_visible(False);ax.spines['right'].set_visible(False)
-    ax.tick_params(colors=MUTED,labelsize=9)
+def ratio_reduction(before: float, after: float) -> float:
+    return 100.0 * (before - after) / before if before > 0 else float('nan')
 
 
-def new_figure(title:str,subtitle:str='')->Figure:
-    fig=Figure(figsize=(11.1,6.7),dpi=100,facecolor='white')
-    fig.suptitle(title,x=.035,y=.975,ha='left',color=DARK,fontweight='bold',fontsize=17)
-    if subtitle:fig.text(.035,.924,subtitle,ha='left',color=MUTED,fontsize=9)
-    return fig
+def make_export(w: dict, d: dict, shared_scale: float | None, report: dict) -> bytes:
+    stream = io.BytesIO()
+    with zipfile.ZipFile(stream, 'w', zipfile.ZIP_DEFLATED) as z:
+        z.writestr('summary.json', json.dumps(report, indent=2, ensure_ascii=False))
+        rows = []
+        for name, r in [('wet', w), ('dry', d)]:
+            z.writestr(f'{name}_mask.png', png(np.where(r['mask'][..., None], 255, 0)
+                                                  .astype(np.uint8).repeat(3, axis=2)))
+            z.writestr(f'{name}_overlay.png', png(visual_overlay(r)))
+            for i, a in enumerate(r['region_px2'], 1):
+                rows.append(dict(condition=name, candidate_region_id=i,
+                                 area_px2=float(a),
+                                 area_mm2=float(a * shared_scale**2) if shared_scale else None))
+        z.writestr('candidate_region_areas.csv', pd.DataFrame(rows).to_csv(index=False))
+    return stream.getvalue()
 
-
-def make_figures(wet:dict,dry:dict,cuts:tuple[float,float])->dict[str,Figure]:
-    paired=[(wet,'WET / BEFORE',TEAL),(dry,'DRY / AFTER',ORANGE)]
-    figs={}
-    f=new_figure('Material detection — automatic tray detection',
-        'GREEN = classified material; uncolored gaps = excluded pixels; PINK = tray interior limit. Review the mask before measuring.')
-    gs=f.add_gridspec(1,2,left=.024,right=.977,bottom=.057,top=.854,wspace=.040)
-    for i,(r,t,c) in enumerate(paired):
-        a=f.add_subplot(gs[0,i]);a.imshow(material_overlay(r));a.axis('off')
-        a.set_title(f'{t}    •    {r["colored_area"]:,.0f} {r["area_unit"]} detected',color=c,fontsize=12,fontweight='bold')
-    figs['Material mask']=f
-
-    f=new_figure('Individual region map',
-         'Each color is an image-based candidate fragment. Only the detected material is segmented; no container-shape mask. Zoom to inspect IDs.')
-    gs=f.add_gridspec(1,2,left=.024,right=.977,bottom=.057,top=.854,wspace=.040)
-    for i,(r,t,c) in enumerate(paired):
-        a=f.add_subplot(gs[0,i]);a.imshow(segmentation_overlay(r,'rainbow'));a.axis('off')
-        a.set_title(f'{t}    •    {len(r["features"])} numbered regions',color=c,fontsize=12,fontweight='bold')
-    figs['All fragments']=f
-
-    f=new_figure('Size-class map',
-         f'Shared thresholds from both images • Small < {cuts[0]:.2f} {wet["unit"]}, '
-         f'Medium {cuts[0]:.2f}–{cuts[1]:.2f}, Large ≥ {cuts[1]:.2f}.')
-    gs=f.add_gridspec(1,2,left=.026,right=.976,bottom=.105,top=.837,wspace=.04)
-    for i,(r,t,c) in enumerate(paired):
-        a=f.add_subplot(gs[0,i]);a.imshow(segmentation_overlay(r,'class'));a.axis('off')
-        counts={s:sum(p['class']==s for p in r['features']) for s in CLASS_RGB}
-        a.set_title(f'{t}  •  {counts["Small"]} small / {counts["Medium"]} medium / {counts["Large"]} large',color=c,fontsize=10,fontweight='bold')
-    from matplotlib.patches import Patch
-    patches=[Patch(color=np.array(col)/255.,label=lab) for lab,col in CLASS_RGB.items()]
-    f.legend(handles=patches,loc='lower center',ncol=3,bbox_to_anchor=(.50,.012),frameon=False,fontsize=11)
-    figs['Size classes']=f
-
-    f=new_figure('Morphology — calibrated visible candidate regions',
-        'Two distributions shown with clear axes. Region geometry is not a verified physical particle measurement.')
-    gs=f.add_gridspec(1,2,left=.09,right=.96,bottom=.16,top=.79,wspace=.30)
-    for pos,key,label in [(gs[0,0],'eq_diameter',f'Equivalent diameter ({wet["unit"]})'),
-                          (gs[0,1],'area',f'Projected region area ({wet["area_unit"]})')]:
-        ax=f.add_subplot(pos)
-        a=np.array([p[key] for p in wet['features']]);b=np.array([p[key] for p in dry['features']]);z=np.r_[a,b]
-        if len(z):
-            upper=max(.01,float(np.quantile(z,.98)))
-            bins=np.linspace(0,upper,24)
-            if len(a):ax.hist(np.clip(a,0,upper),bins=bins,color=TEAL,alpha=.58,label='Wet')
-            if len(b):ax.hist(np.clip(b,0,upper),bins=bins,color=ORANGE,alpha=.58,label='Dry')
-        ax.set_xlabel(label,labelpad=8)
-        ax.set_ylabel('Candidate region count')
-        ax.set_title(label,loc='left',fontweight='bold',fontsize=11,pad=14)
-        ax.legend(frameon=False,fontsize=9,loc='upper right');clean_axis(ax)
-    figs['Measurements']=f
-
-    f=new_figure('Color and browning — wet versus dry',
-         'L* is lightness; a* is green-to-red; b* is blue-to-yellow. Camera-derived values need controlled lighting.')
-    gs=f.add_gridspec(1,2,left=.085,right=.96,bottom=.16,top=.79,wspace=.32)
-    ax=f.add_subplot(gs[0,0]);v=np.array([wet['mean_lab'],dry['mean_lab']]);xx=np.arange(3)
-    ax.bar(xx-.18,v[0],.35,color=TEAL,label='Wet');ax.bar(xx+.18,v[1],.35,color=ORANGE,label='Dry')
-    ax.set_xticks(xx,['L* lightness','a* green↔red','b* blue↔yellow'])
-    ax.tick_params(axis='x',labelrotation=20)
-    for tick in ax.get_xticklabels():tick.set_ha('right')
-    ax.set_ylabel('Mean CIELAB coordinate');ax.set_title('Mean color components',loc='left',fontweight='bold',fontsize=11,pad=14)
-    ax.legend(loc='upper right',frameon=False);clean_axis(ax)
-    ax=f.add_subplot(gs[0,1]);ax.hist(wet['L_sample'],bins=28,range=(0,100),density=True,color=TEAL,alpha=.57,label='Wet')
-    ax.hist(dry['L_sample'],bins=28,range=(0,100),density=True,color=ORANGE,alpha=.57,label='Dry')
-    ax.set_xlabel('L* lightness (0 = black, 100 = white)')
-    ax.set_ylabel('Relative frequency');ax.set_title('Lightness distributions',loc='left',fontweight='bold',fontsize=11,pad=14)
-    ax.legend(loc='upper right',frameon=False);clean_axis(ax)
-    figs['Color change']=f
-    return figs
-
-
-
-
-def figure_bytes(fig:Figure,format='png')->bytes:
-    bio=io.BytesIO()
-    fig.savefig(bio,format=format,dpi=150,bbox_inches='tight',facecolor='white')
-    return bio.getvalue()
-
-
-def photo_png(rgb:np.ndarray)->bytes:
-    bio=io.BytesIO()
-    Image.fromarray(rgb).save(bio,format='PNG')
-    return bio.getvalue()
-
-
-def table_rows(wet:dict,dry:dict)->pd.DataFrame:
-    rows=[]
-    for condition,result in [('Wet',wet),('Dry',dry)]:
-        for p in result['features']:
-            rows.append({'Condition':condition,'Particle ID':p['id'],'Class':p['class'],
-                         'X (px)':round(p['x'],2),'Y (px)':round(p['y'],2),
-                         f'Area ({wet["area_unit"]})':round(p['area'],4),
-                         f'Length ({wet["unit"]})':round(p['length'],4),
-                         f'Width ({wet["unit"]})':round(p['width'],4),
-                         f'Local width ({wet["unit"]})':round(p['local_width'],4),
-                         f'Eq. diameter ({wet["unit"]})':round(p['eq_diameter'],4),
-                         'Circularity':round(p['circularity'],4)})
-    return pd.DataFrame(rows)
-
-
-def change_metrics(wet:dict,dry:dict)->dict:
-    """Descriptive 2D changes; not matched-particle or volume shrinkage."""
-    comparable=wet['unit']=='mm' and dry['unit']=='mm'
-    def reduction(w,d):return 100.0*(w-d)/w if w>0 else None
-    def med(result,key):
-        vals=[float(p[key]) for p in result['features']]
-        return float(np.median(vals)) if vals else None
-    wmed,dmed=med(wet,'eq_diameter'),med(dry,'eq_diameter')
-    warea,darea=med(wet,'area'),med(dry,'area')
-    return {'comparable':comparable,
-            'wet_material_pixels':int(wet['mask'].sum()),
-            'dry_material_pixels':int(dry['mask'].sum()),
-            'wet_material_area':float(wet['colored_area']),
-            'dry_material_area':float(dry['colored_area']),
-            'projected_area_change_pct':reduction(wet['colored_area'],dry['colored_area']) if comparable else None,
-            'apparent_colored_area_reduction_pct':reduction(wet['colored_area'],dry['colored_area']) if comparable else None,
-            'apparent_footprint_reduction_pct':None,
-            'wet_tray_coverage_pct':wet['tray_coverage_pct'],
-            'dry_tray_coverage_pct':dry['tray_coverage_pct'],
-            'coverage_change_pp':dry['tray_coverage_pct']-wet['tray_coverage_pct'],
-            'median_region_diameter_change_pct':reduction(wmed,dmed) if comparable and wmed is not None else None,
-            'median_region_area_change_pct':reduction(warea,darea) if comparable and warea is not None else None,
-            'wet_median_diameter':wmed,'dry_median_diameter':dmed,
-            'wet_median_area':warea,'dry_median_area':darea,
-            'note':'Not true physical shrinkage: the sample may spread, shift, change segmentation, or occlude particles. No individual particles are tracked.'}
-
-
-def build_export(wet:dict,dry:dict,cuts:tuple[float,float],figs:dict[str,Figure],df:pd.DataFrame)->bytes:
-    bio=io.BytesIO()
-    summary={
-      'app':'DryMatter Vision — Streamlit',
-      'date_utc':datetime.now(timezone.utc).isoformat(),
-      'method':'tray-guided HSV/CIELAB foreground without gap filling; gradient watershed candidate regions',
-      'unit':wet['unit'], 'area_unit':wet['area_unit'],
-      'size_class_cutoffs':{'small_below':cuts[0],'large_at_or_above':cuts[1]},
-      'wet':{'regions':len(wet['features']),'material_area':wet['colored_area'],
-             'tray_interior_area':wet['footprint_area'],'tray_coverage_pct':wet['tray_coverage_pct'],'visible_empty_pct':wet['visible_empty_pct'],'mean_Lab':wet['mean_lab'].tolist(),
-             'tone_percent':wet['composition'],'mm_per_px':wet['mm_per_px']},
-      'dry':{'regions':len(dry['features']),'material_area':dry['colored_area'],
-             'tray_interior_area':dry['footprint_area'],'tray_coverage_pct':dry['tray_coverage_pct'],'visible_empty_pct':dry['visible_empty_pct'],'mean_Lab':dry['mean_lab'].tolist(),
-             'tone_percent':dry['composition'],'mm_per_px':dry['mm_per_px']},
-      'delta_E76_mean_color':float(np.linalg.norm(wet['mean_lab']-dry['mean_lab'])),
-      'apparent_2D_changes':change_metrics(wet,dry),
-      'projected_material_area_change_pct':change_metrics(wet,dry)['projected_area_change_pct'],
-      'true_volume_shrinkage_pct':None,
-      'volume_status':'Not measurable from single top-down wet/dry images; thickness/depth required',
-      'warning':'True 3D volume loss cannot be determined from a single overhead image pair without thickness/depth data. Candidate image regions are not verified individual particles. Area changes are not true volumetric shrinkage. Color change needs matched lighting and a color reference.'
-    }
-    with zipfile.ZipFile(bio,'w',zipfile.ZIP_DEFLATED) as z:
-        z.writestr('summary.json',json.dumps(summary,indent=2,ensure_ascii=False))
-        z.writestr('candidate_regions.csv',df.to_csv(index=False))
-        z.writestr('material_area_comparison.csv', pd.DataFrame([
-            {'condition':'wet','material_pixels':int(wet['mask'].sum()),'material_area':wet['colored_area'],'unit':wet['area_unit']},
-            {'condition':'dry','material_pixels':int(dry['mask'].sum()),'material_area':dry['colored_area'],'unit':dry['area_unit']}
-        ]).to_csv(index=False))
-        for cond,result in [('wet',wet),('dry',dry)]:
-            for mode in ('rainbow','class'):
-                z.writestr(f'{cond}_{mode}_labeled.png',photo_png(segmentation_overlay(result,mode)))
-            z.writestr(f'{cond}_material_mask.png',photo_png(material_overlay(result)))
-        for name,fig in figs.items():
-            z.writestr('figures/'+name.lower().replace(' ','_')+'.png',figure_bytes(fig))
-    return bio.getvalue()
-
-
-st.set_page_config(page_title='DryMatter Vision | Drying quality analysis',page_icon='🔬',layout='wide',initial_sidebar_state='expanded')
-st.markdown('''<style>
-.block-container{padding-top:1.15rem;max-width:1750px}
-[data-testid="stSidebar"]{background:var(--secondary-background-color)}
-[data-testid="stSidebar"] *{color:var(--text-color)}
-[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"]{background:var(--background-color);border:1px solid var(--text-color)}
-[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] *{color:var(--text-color)!important}
-[data-testid="stSidebar"] button[kind="primary"] *{color:white!important}
-[data-testid="stMetric"]{border:1px solid rgba(125,144,155,.32);border-radius:12px;padding:12px}
-.dry-credit{opacity:.75;font-size:11px;margin-top:1.7rem}
-.info-box{padding:12px 15px;border-radius:7px;border-left:4px solid #0098A8;background:rgba(0,148,164,.09)}
-</style>''',unsafe_allow_html=True)
-
+st.set_page_config(page_title='DryMatter Vision | Three Measures', page_icon='🔬', layout='wide')
 st.title('DryMatter Vision')
-st.caption('Drying quality • visible material segmentation • calibrated 2D morphology • wet/dry color')
-
+st.caption('Automatic material mask · mean candidate-region area reduction · color change')
 with st.sidebar:
-    st.header('Analyze samples')
-    wet_file=st.file_uploader('Wet / Before',type=['png','jpg','jpeg','webp','tif','tiff'],key='wet')
-    dry_file=st.file_uploader('Dry / After',type=['png','jpg','jpeg','webp','tif','tiff'],key='dry')
-    analyze=st.button('Analyze images',type='primary',use_container_width=True,disabled=wet_file is None or dry_file is None)
-    st.caption('For the best comparison: same camera height, straight overhead view, consistent lighting, ruler in both images.')
-    st.divider()
-    st.markdown('<div class="dry-credit">'+CREDIT+'</div>',unsafe_allow_html=True)
+    st.header('Upload photographs')
+    wet_file = st.file_uploader('Wet / Before', type=['jpg','jpeg','png','webp','tif','tiff'], key='wet')
+    dry_file = st.file_uploader('Dry / After', type=['jpg','jpeg','png','webp','tif','tiff'], key='dry')
+    run = st.button('Analyze images', type='primary', use_container_width=True,
+                    disabled=(wet_file is None or dry_file is None))
+    st.caption('Automatic calibration assumes a metric ruler on the right and a round tray on the left. No manual crop or scale input.')
 
-if analyze:
+if run:
     try:
-        with st.spinner('Finding material, calibrating rulers, and segmenting visible regions…'):
-            wr,wm,wmsg=read_uploaded(wet_file.getvalue())
-            dr,dm,dmsg=read_uploaded(dry_file.getvalue())
-            wet=detect_regions(wr,wm)
-            dry=detect_regions(dr,dm)
-            cuts=assign_classes(wet,dry)
-            figs=make_figures(wet,dry,cuts)
-            df=table_rows(wet,dry)
-            archive=build_export(wet,dry,cuts,figs,df)
-            st.session_state['analysis']={'wet':wet,'dry':dry,'cuts':cuts,'df':df,
-                                          'archive':archive,'wet_msg':wmsg,'dry_msg':dmsg}
-    except Exception as e:
-        st.error('Analysis could not complete: '+str(e))
-        st.session_state.pop('analysis',None)
+        with st.spinner('Detecting rulers, material pixels, and candidate regions...'):
+            wr, wm, wmsg = read_uploaded(wet_file.getvalue())
+            dr, dm, dmsg = read_uploaded(dry_file.getvalue())
+            w, d = analyze(wr, wm), analyze(dr, dm)
+            # Only share calibration if both independently detected values agree.
+            # A single detected ruler cannot prove that the other photo has the same physical scale.
+            shared = None
+            if wm is not None and dm is not None:
+                disagreement = abs(wm - dm) / ((wm + dm) / 2.0)
+                if disagreement <= 0.05:
+                    shared = (wm + dm) / 2.0
+                else:
+                    wmsg += f' Ruler disagreement: {100*disagreement:.1f}%.'
+            elif (wm is not None or dm is not None) and wr.shape == dr.shape:
+                # Images captured at same scale according to study protocol; label inferred rather than validated.
+                shared = wm if wm is not None else dm
+                wmsg += ' Pair scale inferred from one readable ruler and same image dimensions; verify equal camera geometry.'
 
-if 'analysis' not in st.session_state:
-    left,right=st.columns(2)
-    with left:
-        st.subheader('Wet / Before')
-        if wet_file: st.image(wet_file, use_container_width=True)
-        else: st.info('Upload the wet image using the sidebar.')
-    with right:
-        st.subheader('Dry / After')
-        if dry_file:st.image(dry_file,use_container_width=True)
-        else:st.info('Upload the dry image using the sidebar.')
-    st.info('Upload both photographs and select **Analyze images** to see the measurements and visualizations.')
+            st.session_state['last'] = dict(w=w, d=d, scale=shared,
+                                           wet_msg=wmsg, dry_msg=dmsg)
+    except Exception as e:
+        st.session_state.pop('last', None)
+        st.error(f'Analysis failed: {e}')
+
+if 'last' not in st.session_state:
+    st.info('Upload wet and dry images, then select Analyze images.')
     st.stop()
 
-res=st.session_state['analysis']
-wet,dry,cuts,df=res['wet'],res['dry'],res['cuts'],res['df']
-if wet_file is None or dry_file is None:
-    st.warning('Showing the most recent analysis. Upload two images and analyze again to replace it.')
+res = st.session_state['last']
+w, d, mm = res['w'], res['d'], res['scale']
+unit = 'mm²' if mm is not None else 'px²'
+factor = mm**2 if mm is not None else 1.0
+wet_areas = w['region_px2'] * factor
+dry_areas = d['region_px2'] * factor
+nw, nd = len(wet_areas), len(dry_areas)
+mean_w = float(wet_areas.mean()) if nw else float('nan')
+mean_d = float(dry_areas.mean()) if nd else float('nan')
+mean_reduction = ratio_reduction(mean_w, mean_d)
+material_w = int(w['mask'].sum()) * factor
+material_d = int(d['mask'].sum()) * factor
+area_reduction = ratio_reduction(material_w, material_d)
+delta_lab = d['lab'] - w['lab']
+delta_e = float(np.linalg.norm(delta_lab))
 
-c1,c2,c3,c4=st.columns(4)
-c1.metric('Wet candidate regions',len(wet['features']))
-c2.metric('Dry candidate regions',len(dry['features']))
-c3.metric('Mean color difference ΔE*76',f'{np.linalg.norm(wet["mean_lab"]-dry["mean_lab"]):.2f}')
-c4.metric('2D area reduction', (f"{change_metrics(wet,dry)['apparent_colored_area_reduction_pct']:+.1f}%" if change_metrics(wet,dry)['comparable'] else 'Not calibrated'),help='Change in classified material pixels after calibration. This is 2D coverage, not true volume loss.')
-if wet['unit']!='mm':
-    st.warning('Automatic ruler calibration was not validated in BOTH images. Measurements are in pixels. '+res['wet_msg']+' '+res['dry_msg'])
+if mm is None:
+    st.warning('Validated common metric calibration unavailable. The areas below are in pixels², not mm².')
 else:
-    st.caption('Wet: '+res['wet_msg']+'   |   Dry: '+res['dry_msg'])
-st.markdown('<div class="info-box">Green marks classified material only; bright exposed tray/gaps are excluded where distinguishable. Colored coverage is a <b>2D image measurement</b>, not 3D volume. Candidate regions are not validated individual physical particles.</div>',unsafe_allow_html=True)
+    st.success(f'Automatic shared scale: {mm:.5f} mm/pixel ({1/mm:.2f} pixels per mm).')
+with st.expander('Ruler detection details'):
+    st.write('Wet:', res['wet_msg'])
+    st.write('Dry:', res['dry_msg'])
 
-tabs=st.tabs(['Material mask','All fragments','Size classes','Measurements','Shrinkage comparison','Color change','Particle table'])
-with tabs[0]:
-    st.subheader('Material mask — quality check')
-    st.caption('Green = detected material only; exposed tray and gaps remain uncolored. Magenta = detected material pixel boundary (including holes).')
-    col1,col2=st.columns(2)
-    with col1:
-        st.markdown('**WET / BEFORE**')
-        st.image(material_overlay(wet),use_container_width=True)
-    with col2:
-        st.markdown('**DRY / AFTER**')
-        st.image(material_overlay(dry),use_container_width=True)
-with tabs[1]:
-    st.subheader('Every detected candidate region — unique colors and IDs')
-    c1,c2=st.columns(2)
-    with c1:
-        st.markdown(f'**Wet — {len(wet["features"])} regions**')
-        st.image(segmentation_overlay(wet,'rainbow'),use_container_width=True)
-    with c2:
-        st.markdown(f'**Dry — {len(dry["features"])} regions**')
-        st.image(segmentation_overlay(dry,'rainbow'),use_container_width=True)
-    st.caption('Numbers match the particle table. Zoom by opening the downloaded PNG at full resolution.')
-with tabs[2]:
-    st.subheader('Size classes — comparable thresholds across the pair')
-    st.caption(f'Small: < {cuts[0]:.2f} {wet["unit"]}  ·  Medium: {cuts[0]:.2f}–{cuts[1]:.2f}  ·  Large: ≥ {cuts[1]:.2f} {wet["unit"]}')
-    st.markdown('🔵 Small　 🟢 Medium　 🩷 Large')
-    c1,c2=st.columns(2)
-    with c1:st.image(segmentation_overlay(wet,'class'),use_container_width=True)
-    with c2:st.image(segmentation_overlay(dry,'class'),use_container_width=True)
-    counts=pd.DataFrame({'Size':['Small','Medium','Large'],
-      'Wet':[sum(p['class']==s for p in wet['features']) for s in ['Small','Medium','Large']],
-      'Dry':[sum(p['class']==s for p in dry['features']) for s in ['Small','Medium','Large']]})
-    st.markdown('**Size-class counts (same thresholds for wet and dry)**')
-    counts['Wet share (%)']=(100*counts['Wet']/max(1,counts['Wet'].sum())).round(1)
-    counts['Dry share (%)']=(100*counts['Dry']/max(1,counts['Dry'].sum())).round(1)
-    st.dataframe(counts,hide_index=True,use_container_width=True)
-with tabs[3]:
-    st.subheader('Two-dimensional size and shape distribution')
-    st.pyplot(make_figures(wet,dry,cuts)['Measurements'],use_container_width=True)
-    a,b=st.columns(2)
-    for col,r,name in [(a,wet,'Wet'),(b,dry,'Dry')]:
+mask_tab, area_tab, color_tab = st.tabs(['1. Material mask', '2. Mean area reduction', '3. Color change'])
+with mask_tab:
+    st.subheader('Automatic material-only masks')
+    st.caption('Green = material-classified pixels; magenta = their boundaries. Silver gaps remain unmasked where the classifier can distinguish them.')
+    c1, c2 = st.columns(2)
+    for col, name, r in [(c1, 'WET / BEFORE', w), (c2, 'DRY / AFTER', d)]:
         with col:
-            st.markdown('**'+name+'**')
-            st.metric('Material-colored area',f'{r["colored_area"]:,.0f} {r["area_unit"]}')
-            st.metric('Tray interior area (reference)',f'{r["footprint_area"]:,.0f} {r["area_unit"]}')
-            st.metric('Tray coverage',f'{r["tray_coverage_pct"]:.1f}%')
-            st.metric('Exposed tray / visible gaps',f'{r["visible_empty_pct"]:.1f}%')
-    st.caption('Material area counts only pixels classified as material. Tray interior is a fixed reference, not a material footprint. All results are projected 2D measurements, not 3D volume.')
-with tabs[4]:
-    st.subheader('Measured material projected-area change')
-    st.latex(r'S_{A}(\%)=\frac{A_{\mathrm{wet}}-A_{\mathrm{dry}}}{A_{\mathrm{wet}}}\times100')
-    st.caption('Every material-classified pixel counts, wherever it lies inside the tray. Exposed metal does not count. Positive = smaller dry projected area; negative = larger dry projected area.')
-    change=change_metrics(wet,dry)
-    if not change['comparable']:
-        st.warning('Cannot provide a defensible shrinkage percentage: valid ruler calibration is required in BOTH photographs. Upload both calibrated images and rerun.')
-    else:
-        def display_change(value):
-            return 'Not available' if value is None else f'{value:+.1f}%'
-        a,b,c=st.columns(3)
-        a.metric('Colored area reduction (2D)',display_change(change['apparent_colored_area_reduction_pct']),help='Positive means less color-segmented surface in the dry photo. Not true volume shrinkage.')
-        b.metric('Tray coverage change (percentage points)',f"{change['coverage_change_pp']:+.1f} pp",help='Dry coverage percentage minus wet coverage percentage. Negative means more visibly uncovered tray; NOT volume shrinkage.')
-        c.metric('Median region area reduction',display_change(change['median_region_area_change_pct']),help='Unmatched candidate regions. A distribution statistic, not physical particle shrinkage.')
-        if change['apparent_colored_area_reduction_pct'] is not None and change['apparent_colored_area_reduction_pct']<0:
-            st.info('The apparent segmented area INCREASED after drying. A negative reduction is not evidence of physical expansion; changing visibility or segmentation can cause this.')
-        st.markdown('**Actual material pixels and calibrated areas**')
-        st.dataframe(pd.DataFrame([
-            {'Condition':'Wet', 'Detected material pixels':int(wet['mask'].sum()), 'Area (mm²)':wet['colored_area']},
-            {'Condition':'Dry', 'Detected material pixels':int(dry['mask'].sum()), 'Area (mm²)':dry['colored_area']}
-        ]), hide_index=True, use_container_width=True)
-        st.markdown('**Other measured quantities**')
-        st.dataframe(pd.DataFrame([
-            {'Metric':'Colored material area','Wet':wet['colored_area'],'Dry':dry['colored_area'],'Unit':wet['area_unit']},
-            {'Metric':'Tray interior reference area','Wet':wet['footprint_area'],'Dry':dry['footprint_area'],'Unit':wet['area_unit']},
-            {'Metric':'Median region equivalent diameter','Wet':change['wet_median_diameter'],'Dry':change['dry_median_diameter'],'Unit':wet['unit']},
-            {'Metric':'Median candidate region area','Wet':change['wet_median_area'],'Dry':change['dry_median_area'],'Unit':wet['area_unit']}
-        ]),hide_index=True,use_container_width=True)
-    st.warning('**True 3D volume shrinkage is not measurable from these top-view photos alone.** Drying may reduce height while visible tray coverage stays the same or increases. To calculate volume loss, you need depth or thickness measurements (e.g., side view, calibrated depth map or 3D scan).')
-with tabs[5]:
-    st.subheader('Color and browning indicators')
-    st.pyplot(make_figures(wet,dry,cuts)['Color change'],use_container_width=True)
-    st.markdown('**What L*, a*, and b* mean**')
-    st.markdown('**L*** = lightness (0 is black; 100 is white). **a*** = green (negative) to red (positive). **b*** = blue (negative) to yellow (positive). **ΔE*76** measures distance between two average colors in this three-dimensional color space; **it is not a percentage**. A value such as **7.08** means **7.08 CIELAB units**, not 7.08% change.')
-    st.caption('These are approximate camera-based color values. Control lighting, exposure, and white balance for scientific comparisons.')
-with tabs[6]:
-    st.subheader('Candidate particle measurements')
-    st.dataframe(df,use_container_width=True,height=520,hide_index=True)
-    st.download_button('Download measurements CSV',data=df.to_csv(index=False).encode('utf-8-sig'),file_name='drymatter_candidate_regions.csv',mime='text/csv')
+            st.markdown(f'**{name}**')
+            st.image(visual_overlay(r), use_container_width=True)
+            st.caption(f'Material pixels: {int(r["mask"].sum()):,} · '
+                       f'Tray coverage: {100*r["mask"].sum()/r["tray"].sum():.1f}%')
+    st.info('Mask quality is crucial: reflective metal, shadows, and brown staining may be misclassified. Check both overlays before interpreting results.')
 
-st.divider()
-st.download_button('Download full results (ZIP)',data=res['archive'],file_name='DryMatter_Vision_Results.zip',mime='application/zip',type='primary')
-st.caption(CREDIT)
+with area_tab:
+    st.subheader('Mean candidate-region area reduction')
+    st.latex(r'\bar A_{wet}=\frac{\sum_{i=1}^{N_{wet}} A_{i,wet}}{N_{wet}}')
+    st.latex(r'\bar A_{dry}=\frac{\sum_{j=1}^{N_{dry}} A_{j,dry}}{N_{dry}}')
+    st.latex(r'S_{mean}(\%)=\frac{\bar A_{wet}-\bar A_{dry}}{\bar A_{wet}}\times100')
+    c1,c2,c3 = st.columns(3)
+    c1.metric('Mean wet region area', f'{mean_w:,.2f} {unit}')
+    c2.metric('Mean dry region area', f'{mean_d:,.2f} {unit}')
+    c3.metric('Mean region area reduction', f'{mean_reduction:+.1f}%' if np.isfinite(mean_reduction) else 'N/A')
+    st.dataframe(pd.DataFrame([
+        dict(Condition='Wet', Candidate_regions=nw, Mean_region_area=mean_w, Total_material_area=material_w),
+        dict(Condition='Dry', Candidate_regions=nd, Mean_region_area=mean_d, Total_material_area=material_d),
+    ]), hide_index=True, use_container_width=True)
+    st.caption(f'Area units above: {unit}. Total mask area reduction (separate statistic): {area_reduction:+.1f}%.')
+    st.warning('These are watershed image regions, not verified individual particles. A positive mean reduction is not proof of physical particle or volume shrinkage. Negative results are not overwritten.')
+
+with color_tab:
+    st.subheader('Mean CIELAB color change')
+    st.latex(r'\Delta E^*_{76}=\sqrt{(\Delta L^*)^2+(\Delta a^*)^2+(\Delta b^*)^2}')
+    c1,c2,c3 = st.columns(3)
+    c1.metric('Mean color difference ΔE*76', f'{delta_e:.2f}')
+    c2.metric('Lightness change ΔL*', f'{delta_lab[0]:+.2f}')
+    c3.metric('Red/green change Δa*', f'{delta_lab[1]:+.2f}')
+    st.dataframe(pd.DataFrame([
+        dict(Condition='Wet', **{'L*':w['lab'][0],'a*':w['lab'][1],'b*':w['lab'][2]}),
+        dict(Condition='Dry', **{'L*':d['lab'][0],'a*':d['lab'][1],'b*':d['lab'][2]}),
+        dict(Condition='Dry minus wet', **{'L*':delta_lab[0],'a*':delta_lab[1],'b*':delta_lab[2]}),
+    ]), hide_index=True, use_container_width=True)
+    st.caption('Camera-derived CIELAB approximations, not spectrophotometer measurements. Matched lighting, exposure and white balance are required for robust comparisons.')
+
+report = {
+    'date_utc': datetime.now(timezone.utc).isoformat(),
+    'mm_per_pixel_shared': mm,
+    'area_unit': unit,
+    'wet': {'material_pixels': int(w['mask'].sum()), 'candidate_regions': nw,
+            'mean_region_area': mean_w, 'total_material_area': material_w,
+            'mean_lab':w['lab'].tolist()},
+    'dry': {'material_pixels': int(d['mask'].sum()), 'candidate_regions': nd,
+            'mean_region_area': mean_d, 'total_material_area': material_d,
+            'mean_lab':d['lab'].tolist()},
+    'mean_region_area_reduction_pct': mean_reduction,
+    'total_projected_material_area_reduction_pct': area_reduction,
+    'delta_E76': delta_e,
+    'delta_Lab': delta_lab.tolist(),
+    'limitation':'2D camera masks; watershed candidate regions are not verified physical particles. No 3D volume shrinkage is inferred.'
+}
+st.download_button('Download masks, region areas and report (ZIP)',
+                   make_export(w,d,mm,report), file_name='DryMatter_Vision_Results.zip',
+                   mime='application/zip', type='primary')
