@@ -397,8 +397,12 @@ def region_boxplot_figure(df: pd.DataFrame, area_column: str) -> Figure:
               for name in ('Wet', 'Dry')]
     series = [a[np.isfinite(a) & (a > 0)] for a in series]
     if all(len(a) for a in series):
-        bx = ax.boxplot(series, patch_artist=True, labels=['Wet','Dry'],
+        # Avoid the renamed/removed `labels` keyword in newer Matplotlib.
+        # Position labels separately for compatibility with 3.7+.
+        bx = ax.boxplot(series, patch_artist=True,
                         showmeans=True, meanline=True, showfliers=True)
+        ax.set_xticks([1, 2])
+        ax.set_xticklabels(['Wet', 'Dry'])
         for patch, color in zip(bx['boxes'], ['#007F90','#C66A34']):
             patch.set_facecolor(color)
             patch.set_alpha(.5)
