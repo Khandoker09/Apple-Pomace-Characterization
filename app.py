@@ -24,6 +24,8 @@ from scipy.signal import find_peaks
 from skimage.morphology import h_maxima, remove_small_objects
 from skimage.measure import regionprops
 from skimage.segmentation import watershed
+from skimage.feature import peak_local_max
+from skimage.filters import sobel
 
 def read_uploaded(data:bytes,max_side:int=1150)->tuple[np.ndarray,float|None,str]:
     with Image.open(io.BytesIO(data)) as im:
@@ -196,36 +198,86 @@ def material_mask(rgb: np.ndarray):
 
 
 def segmentation(rgb: np.ndarray, mask: np.ndarray, detail: bool = True):
-    """Automatic geometry-guided visible-region partition, NOT verified instances.
+    """Texture-and-shape-assisted candidate region segmentation.
 
-    Detailed mode finds more local lobes and retains smaller disconnected pieces;
-    conservative mode suppresses weak peaks. Agreement between the two is a
-    diagnostic of algorithm sensitivity, not a probability of correctness.
+    Crucially, candidate regions are NOT guaranteed to be single physical
+    particles. Hidden/overlapping pieces cannot be resolved from an overhead
+    photograph without a trained, validated instance model.
     """
-    clean = remove_small_objects(mask.astype(bool), min_size=8 if detail else 18)
-    # Avoid morphological opening in detailed mode because it deletes thin
-    # individual peel fragments and changes the measured mask area.
     if not detail:
+        clean = remove_small_objects(mask.astype(bool), min_size=18)
         clean = cv2.morphologyEx(clean.astype(np.uint8), cv2.MORPH_OPEN,
             cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))) > 0
-    distance = ndi.distance_transform_edt(clean).astype(np.float32)
-    distance = ndi.gaussian_filter(distance, sigma=0.85 if detail else 1.4)
-    seed_mask = h_maxima(distance, h=1.15 if detail else 2.5) & \
-                (distance >= (1.7 if detail else 3.2))
-    _, markers = cv2.connectedComponents(seed_mask.astype(np.uint8), 8)
-    if markers.max() < 1:
-        _, labels = cv2.connectedComponents(clean.astype(np.uint8), 8)
+        dist = ndi.gaussian_filter(ndi.distance_transform_edt(clean), 1.4)
+        seeds = h_maxima(dist, h=2.5) & (dist >= 3.2)
+        _, markers = cv2.connectedComponents(seeds.astype(np.uint8), 8)
+        if markers.max() < 1:
+            _, labels = cv2.connectedComponents(clean.astype(np.uint8), 8)
+        else:
+            labels = watershed(-dist, markers, mask=clean)
+        min_area = 26
     else:
-        # The watershed only separates areas where pixels were already
-        # material-classified. Texture alone cannot reveal hidden particles.
-        labels = watershed(-distance, markers, mask=clean, watershed_line=False)
-    kept = [region for region in regionprops(labels) if region.area >= (9 if detail else 26)]
-    lut = np.zeros(int(labels.max()) + 1, dtype=np.int32)
-    for i, region in enumerate(kept, 1):
-        lut[region.label] = i
+        clean = remove_small_objects(mask.astype(bool), min_size=5)
+        if not clean.any():
+            return np.zeros(mask.shape, np.int32), np.array([], dtype=float)
+        dist = ndi.gaussian_filter(ndi.distance_transform_edt(clean).astype(np.float32), 0.8)
+        lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+        lum = ndi.gaussian_filter(lab[:, :, 0].astype(np.float32)/255., 1.0)
+        a = ndi.gaussian_filter(lab[:, :, 1].astype(np.float32)/255., 1.0)
+        b = ndi.gaussian_filter(lab[:, :, 2].astype(np.float32)/255., 1.0)
+        gradient = .45 * sobel(lum) + .30 * sobel(a) + .25 * sobel(b)
+        gradient = np.clip(gradient / max(float(np.quantile(gradient[clean], .95)), 1e-6), 0, 1)
+        shape_peaks = peak_local_max(dist, min_distance=8, threshold_abs=1.8,
+            labels=clean.astype(np.uint8), exclude_border=False, num_peaks=1800)
+        texture_peaks = peak_local_max(lum, min_distance=11, threshold_rel=.08,
+            labels=clean.astype(np.uint8), exclude_border=False, num_peaks=900)
+        points = [(int(y),int(x)) for y,x in shape_peaks]
+        taken = np.zeros(clean.shape, np.uint8)
+        for y,x in points:
+            cv2.circle(taken, (x,y), 7, 255, -1)
+        for y,x in texture_peaks:
+            y,x = int(y),int(x)
+            if dist[y,x] < 2 or taken[y,x]:
+                continue
+            local = lum[max(0,y-10):y+11, max(0,x-10):x+11]
+            if lum[y,x] - np.percentile(local,30) < .055:
+                continue
+            points.append((y,x))
+            cv2.circle(taken, (x,y), 8, 255, -1)
+        markers = np.zeros(clean.shape, np.int32)
+        for i,(y,x) in enumerate(points,1):
+            markers[y,x] = i
+        # Assign at least one marker to each disconnected visible component.
+        # This avoids losing small material islands simply because they have
+        # no strong distance or texture peak.
+        n, components = cv2.connectedComponents(clean.astype(np.uint8),8)
+        for i in range(1,n):
+            local_mask = components == i
+            if not np.any(markers[local_mask]):
+                ys,xs = np.where(local_mask)
+                idx = int(np.argmax(dist[local_mask]))
+                markers[ys[idx],xs[idx]] = len(points) + i
+        elevation = .65 * gradient + .35 * (1 - dist/(np.percentile(dist[clean],95)+.1))
+        labels = watershed(elevation, markers, mask=clean)
+        min_area = 7
+    retained = [p for p in regionprops(labels) if p.area >= min_area]
+    lut = np.zeros(int(labels.max())+1,np.int32)
+    for i,p in enumerate(retained,1):
+        lut[p.label] = i
     labels = lut[labels]
-    return labels, np.array([region.area for region in regionprops(labels)], dtype=np.float64)
+    return labels, np.array([r.area for r in regionprops(labels)],dtype=np.float64)
 
+
+def outline_region_overlay(result: dict, conservative: bool = False) -> np.ndarray:
+    """Original photo with candidate boundaries; unlike color fills, the pieces remain visible."""
+    rgb = result['rgb'].copy()
+    labels = result['coarse_labels'] if conservative else result['labels']
+    active = labels > 0
+    border = np.zeros(active.shape,bool)
+    border[1:,:] |= ((labels[1:,:] != labels[:-1,:]) & active[1:,:])
+    border[:,1:] |= ((labels[:,1:] != labels[:,:-1]) & active[:,1:])
+    rgb[border] = (230,30,145)
+    return rgb
 
 def analyze(rgb: np.ndarray, mm_per_px: float | None) -> dict:
     material, tray, details = material_mask(rgb)
@@ -442,6 +494,7 @@ def make_export(w: dict, d: dict, shared_scale: float | None, report: dict, regi
                                                   .astype(np.uint8).repeat(3, axis=2)))
             z.writestr(f'{name}_overlay.png', png(visual_overlay(r)))
             z.writestr(f'{name}_numbered_regions.png', png(colored_region_overlay(r)))
+            z.writestr(f'{name}_outlines_on_original.png', png(outline_region_overlay(r)))
             z.writestr(f'{name}_conservative_regions.png', png(colored_region_overlay(r, conservative=True)))
             for i, a in enumerate(r['region_px2'], 1):
                 rows.append(dict(condition=name, candidate_region_id=i,
@@ -469,7 +522,7 @@ def make_export(w: dict, d: dict, shared_scale: float | None, report: dict, regi
 
 st.set_page_config(page_title='DryMatter Vision | Four Measures', page_icon='🔬', layout='wide')
 st.title('DryMatter Vision')
-st.caption('Automatic material mask · mean area reduction · color quality control · detailed region maps and multi-view distributions')
+st.caption('Automatic material mask · mean area reduction · color quality control · edge-assisted region maps and multi-view distributions')
 with st.sidebar:
     st.header('Upload photographs')
     wet_file = st.file_uploader('Wet / Before', type=['jpg','jpeg','png','webp','tif','tiff'], key='wet')
@@ -580,7 +633,7 @@ regions = region_measurements(w, d, mm)
 area_column = 'Area (mm²)' if mm is not None else 'Area (px²)'
 with particle_tab:
     st.subheader('Detailed candidate-region map')
-    st.caption('Detailed shape-based segmentation retains more small fragments. Every colored patch is a candidate, not a verified particle. Stacked or touching pieces can remain merged; some textured pieces can split.')
+    st.caption('Texture-and-shape-assisted segmentation retains more candidate fragments. Every colored patch is a candidate, not a verified particle. Stacked or touching pieces can remain merged; some textured pieces can split.')
     wet_col, dry_col = st.columns(2)
     with wet_col:
         st.markdown(f'**WET — {nw} regions**')
@@ -588,6 +641,11 @@ with particle_tab:
     with dry_col:
         st.markdown(f'**DRY — {nd} regions**')
         st.image(colored_region_overlay(d), use_container_width=True)
+    st.subheader('Boundaries on the original photographs')
+    st.caption('Pink lines show candidate region boundaries without hiding the original material. Inspect these first to find merges or artificial splits.')
+    oc1,oc2=st.columns(2)
+    oc1.image(outline_region_overlay(w), use_container_width=True)
+    oc2.image(outline_region_overlay(d), use_container_width=True)
     st.subheader('Algorithm sensitivity — detailed versus conservative')
     st.dataframe(pd.DataFrame([
         {'Condition':'Wet','Detailed regions':nw,'Conservative regions':int(w['coarse_labels'].max())},
