@@ -88,83 +88,109 @@ def auto_ruler(rgb: np.ndarray) -> tuple[float | None, str]:
     return mm,f'Ruler recognized: 1 cm ≈ {step:.1f} px ({mm:.4f} mm/px, {n} ticks).'
 
 
-def material_mask(rgb: np.ndarray):
-    """Find *material*, not a container: no circle/rectangle/ellipse ROI.
+def material_mask(rgb: np.ndarray, bounds: tuple[float, float, float, float] | None = None):
+    """Estimate a sample silhouette using color seeds + constrained GrabCut.
 
-    First choose warm-colored candidate pixels, then use an adaptive bright
-    core to find the largest coherent sample. Fill its *observed irregular*
-    contour and retain candidate pixels nearby. This reduces false positives
-    from dark warm metal walls while preserving rectangular trays and round
-    heaps. It is a heuristic and still requires visual verification.
+    The optional bounds are an EXCLUSION crop (left, top, right, bottom,
+    fractions of the image). They are not counted as sample geometry.
+    The final mask follows image pixels, not a preset circle or rectangle.
     """
     h, w = rgb.shape[:2]
-    smooth = cv2.GaussianBlur(rgb, (3, 3), 0.65)
+    if bounds is None:
+        bounds = (0., 0., 1., 1.)
+    left, top, right, bottom = bounds
+    x0, y0 = int(left*w), int(top*h)
+    x1, y1 = int(right*w), int(bottom*h)
+    if x1-x0 < 90 or y1-y0 < 90:
+        raise ValueError('Sample crop is too small; enlarge its bounds.')
+    patch = np.ascontiguousarray(rgb[y0:y1, x0:x1])
+    ph, pw = patch.shape[:2]
+    smooth = cv2.GaussianBlur(patch, (5, 5), 0)
     hsv = cv2.cvtColor(smooth, cv2.COLOR_RGB2HSV)
     hue, sat, val = cv2.split(hsv)
-    red_minus_blue = smooth[:, :, 0].astype(np.int16) - smooth[:, :, 2].astype(np.int16)
-
-    # Warm apple pomace: include reddish skin, yellow fibrous pulp and brown
-    # dried fragments, but not gray glass/steel/white backgrounds or rulers.
-    chromatic = ((sat >= 50) & (val >= 38) &
-                 ((hue <= 42) | (hue >= 169)) & (red_minus_blue > 13))
-    if int(chromatic.sum()) < max(150, h*w*0.003):
-        raise ValueError('Could not locate sufficiently colored pomace. '
-                         'Use an evenly lit, overhead photo against a neutral tray.')
-
-    # Otsu on warm *candidate* pixels identifies the main bright fibrous mass.
-    # Brown reflective walls are commonly darker than the material. This
-    # boundary is learned from the sample pixels, never from vessel geometry.
-    bright_values = val[chromatic].astype(np.uint8)
-    otsu, _ = cv2.threshold(bright_values, 0, 255,
-                            cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-    if np.percentile(bright_values, 90) < 142:
-        cutoff = int(np.percentile(bright_values, 53))
-    else:
-        cutoff = max(115, int(otsu))
-    bright = chromatic & (val >= cutoff)
-    ksize = max(7, int(round(min(h, w)*0.013)) | 1)
-    closed = cv2.morphologyEx(np.uint8(bright)*255, cv2.MORPH_CLOSE,
-               cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize,ksize)))
-    n, objects, stats, centroids = cv2.connectedComponentsWithStats(closed, 8)
-    if n < 2:
-        raise ValueError('No connected material core found in this image.')
-    # Prefer the largest contiguous textured/colorful sample. The ruler is
-    # almost monochrome and should never be selected as the main material.
-    main = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-    if stats[main,cv2.CC_STAT_AREA] < h*w*.012:
-        raise ValueError('The detected material core is too small for analysis.')
-    seed = np.uint8(objects == main)
-    contours, _ = cv2.findContours(seed, cv2.RETR_EXTERNAL,
-                                    cv2.CHAIN_APPROX_SIMPLE)
-    silhouette = np.zeros((h, w), np.uint8)
-    cv2.drawContours(silhouette, [max(contours,key=cv2.contourArea)], -1, 255, -1)
-    # Remove thin isolated streaks along the vessel wall without assuming any
-    # circular/rectangular shape for the actual sample.
-    trim = max(11, int(round(min(h,w)*.024)) | 1)
-    silhouette = cv2.morphologyEx(silhouette, cv2.MORPH_OPEN,
-                cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(trim,trim)))
-    # A small outward allowance recovers darker peel/fiber edges. It does not
-    # expand the observed silhouette to match any preconceived tray shape.
-    halo = max(5, int(round(min(h,w)*.011)) | 1)
-    nearby = cv2.dilate(silhouette,
-             cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(halo,halo)))>0
-    foreground = chromatic & nearby
-    foreground = cv2.morphologyEx(np.uint8(foreground)*255,cv2.MORPH_OPEN,
-                          cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(2,2)))>0
-    # Never let a tiny disconnected highlight in a tray wall count as sample.
-    raw_count=int(foreground.sum())
-    if raw_count < 200:
-        raise ValueError('Too few material pixels remain after separating the tray.')
-    mask_info={
-        'kind':'material-derived irregular silhouette',
-        'method':'warm-color + adaptive intensity + largest connected material core',
-        'brightness_threshold':cutoff,
-        'foreground_pixels':raw_count,
-        'footprint_pixels':int((silhouette>0).sum()),
-        'mask_fraction_pct':round(raw_count*100/(h*w),2),
-        'limitation':'Warm-colored glass/metal reflections can resemble pomace. Verify the Material mask view.'
-    }
-    return foreground, (silhouette>0), mask_info
+    lab = cv2.cvtColor(smooth, cv2.COLOR_RGB2LAB)
+    # High-chroma, darker material is a more trustworthy SEED than every
+    # 'warm' pixel: paper, beige worktops and wood can also be warm.
+    warm = (((hue < 44) | (hue > 168)) & (sat >= 60) & (val >= 30))
+    seed = (warm & ((sat >= 88) | (val < 145))).astype(np.uint8)
+    k = max(3, int(round(min(ph, pw)*.012)) | 1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(k,k))
+    seed = cv2.morphologyEx(seed, cv2.MORPH_CLOSE, kernel)
+    count, cc, stats, centers = cv2.connectedComponentsWithStats(seed, 8)
+    if count <= 1:
+        raise ValueError('No strongly colored material seed was found. Try tighter sample crop bounds.')
+    candidates=[]
+    for label in range(1, count):
+        area=int(stats[label, cv2.CC_STAT_AREA])
+        if area < max(100, int(ph*pw*.002)):
+            continue
+        x, y, cw, ch = stats[label, :4]
+        touches = x < 3 or y < 3 or x+cw >= pw-3 or y+ch >= ph-3
+        cx,cy=centers[label]
+        distance=((cx-pw/2)/(pw/2))**2+((cy-ph/2)/(ph/2))**2
+        score = area * (0.12 if touches else 1.) / (1 + .65*distance)
+        candidates.append((score,label))
+    if not candidates:
+        raise ValueError('No sufficiently large material component; tighten the crop to the sample.')
+    _, chosen=max(candidates)
+    core=(cc==chosen).astype(np.uint8)
+    # Fill gaps in the strong-color seed so dark/bright fragments are kept.
+    core=cv2.morphologyEx(core, cv2.MORPH_CLOSE, kernel)
+    contours,_=cv2.findContours(core,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+    sure=np.zeros((ph,pw),np.uint8)
+    cv2.drawContours(sure,[max(contours,key=cv2.contourArea)],-1,1,-1)
+    # GrabCut learns BOTH the sample's colors and the surrounding worktop.
+    # Force a border background; a crop that cuts through the sample must be
+    # expanded by the user rather than inventing pixels outside the photo.
+    grow=max(7,int(min(ph,pw)*.035))
+    dilation=cv2.dilate(sure,cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(grow|1,grow|1)))
+    gc=np.full((ph,pw),cv2.GC_PR_BGD,np.uint8)
+    gc[dilation>0]=cv2.GC_PR_FGD
+    erode_size=max(3,int(min(ph,pw)*.012)|1)
+    inner=cv2.erode(sure,cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(erode_size,erode_size)))
+    gc[inner>0]=cv2.GC_FGD
+    margin=max(3,int(min(ph,pw)*.012))
+    gc[:margin,:]=cv2.GC_BGD;gc[-margin:,:]=cv2.GC_BGD
+    gc[:,:margin]=cv2.GC_BGD;gc[:,-margin:]=cv2.GC_BGD
+    if not np.any(gc==cv2.GC_FGD):
+        raise ValueError('Sample crop leaves no reliable foreground seed.')
+    bg_model=np.zeros((1,65),np.float64); fg_model=np.zeros((1,65),np.float64)
+    try:
+        cv2.grabCut(cv2.cvtColor(patch,cv2.COLOR_RGB2BGR),gc,None,
+                    bg_model,fg_model,5,cv2.GC_INIT_WITH_MASK)
+        selected=np.isin(gc,(cv2.GC_FGD,cv2.GC_PR_FGD)).astype(np.uint8)
+    except cv2.error:
+        selected=sure.copy()  # Conservative fallback, never include whole worktop.
+    # Keep only the component connected to the original sample seed.
+    selected=cv2.morphologyEx(selected,cv2.MORPH_CLOSE,kernel)
+    n, labels, stat, _=cv2.connectedComponentsWithStats(selected,8)
+    ranked=[(int(np.count_nonzero((labels==i)&(sure>0))),i)
+            for i in range(1,n) if stat[i,cv2.CC_STAT_AREA]>100]
+    if not ranked or max(ranked)[0] == 0:
+        raise ValueError('Foreground separation failed; try a tighter crop or a clearer photo.')
+    selected=(labels==max(ranked)[1]).astype(np.uint8)
+    contours,_=cv2.findContours(selected,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+    silhouette=np.zeros((ph,pw),np.uint8)
+    cv2.drawContours(silhouette,[max(contours,key=cv2.contourArea)],-1,1,-1)
+    # A small erosion of the edge reduces contamination by tray walls.
+    trim=max(3,int(round(min(ph,pw)*.006))|1)
+    silhouette=cv2.morphologyEx(silhouette,cv2.MORPH_OPEN,
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(trim,trim)))
+    # Reject neutral/white reflections but retain brown/dark material.
+    foreground=(silhouette>0)&(sat>=35)&(val>=25)
+    if foreground.sum() < max(200,ph*pw*.005):
+        raise ValueError('Too few material pixels. Check the green mask or adjust the crop.')
+    mask=np.zeros((h,w),bool); footprint=np.zeros((h,w),bool)
+    mask[y0:y1,x0:x1]=foreground
+    footprint[y0:y1,x0:x1]=silhouette>0
+    info={'kind':'image-derived irregular silhouette',
+          'method':'strong-color seed + foreground/background GrabCut + connected component',
+          'foreground_pixels':int(mask.sum()),
+          'footprint_pixels':int(footprint.sum()),
+          'mask_fraction_pct':round(100*mask.mean(),2),
+          'crop_bounds':list(bounds),
+          'limitation':'Heuristic segmentation; inspect green material and pink boundary before interpreting results.'}
+    return mask,footprint,info
 
 
 def material_overlay(result: dict) -> np.ndarray:
@@ -179,8 +205,8 @@ def material_overlay(result: dict) -> np.ndarray:
     return rgb
 
 
-def detect_regions(rgb: np.ndarray, mm: float|None) -> dict:
-    fg,roi,info=material_mask(rgb)
+def detect_regions(rgb: np.ndarray, mm: float|None, bounds=None) -> dict:
+    fg,roi,info=material_mask(rgb,bounds)
     if fg.sum()<300:
         raise ValueError('The colored sample was not identified. Use a clear overhead photo in a contrasting tray.')
     hsv=cv2.cvtColor(rgb,cv2.COLOR_RGB2HSV)
@@ -290,7 +316,7 @@ def segmentation_overlay(result:dict,mode='rainbow',numbers=True)->np.ndarray:
     lut=np.zeros((int(lab.max())+1,3),np.uint8)
     class_by_id={p['id']:p['class'] for p in result['features']}
     for i in range(1,len(lut)):
-        lut[i]=region_color(i) if mode=='rainbow' else CLASS_RGB.get(class_by_id[i], (140,140,140))
+        lut[i]=region_color(i) if mode=='rainbow' else CLASS_RGB.get(class_by_id.get(i, 'Unclassified'), (140,140,140))
     painted=lut[lab]
     src[active]=np.clip(.24*src[active].astype(float)+.76*painted[active],0,255).astype(np.uint8)
     # Only draw boundaries inside foreground. We never outline the metal rim.
@@ -491,6 +517,16 @@ with st.sidebar:
     st.header('Analyze samples')
     wet_file=st.file_uploader('Wet / Before',type=['png','jpg','jpeg','webp','tif','tiff'],key='wet')
     dry_file=st.file_uploader('Dry / After',type=['png','jpg','jpeg','webp','tif','tiff'],key='dry')
+    with st.expander('Improve detection: sample crop (optional)'):
+        st.caption('Percentages of the original image. Exclude ruler and surrounding table; keep the entire sample and a thin background border. These bounds do not set the detected shape.')
+        wet_x=st.slider('Wet horizontal bounds (%)',0,100,(0,100),key='wet_x')
+        wet_y=st.slider('Wet vertical bounds (%)',0,100,(0,100),key='wet_y')
+        dry_x=st.slider('Dry horizontal bounds (%)',0,100,(0,100),key='dry_x')
+        dry_y=st.slider('Dry vertical bounds (%)',0,100,(0,100),key='dry_y')
+    with st.expander('Manual ruler calibration (optional)'):
+        st.caption('Enter measured pixels between TWO marks exactly 10 mm apart in each original uploaded photo. Zero means use automatic ruler detection. Enter the pixel distance as measured in the ORIGINAL photo. The app handles resizing automatically.')
+        wet_ten_mm=st.number_input('Wet: pixels per 10 mm (0 = auto)',min_value=0.0,value=0.0,step=1.0)
+        dry_ten_mm=st.number_input('Dry: pixels per 10 mm (0 = auto)',min_value=0.0,value=0.0,step=1.0)
     analyze=st.button('Analyze images',type='primary',use_container_width=True,disabled=wet_file is None or dry_file is None)
     st.caption('For the best comparison: same camera height, straight overhead view, consistent lighting, ruler in both images.')
     st.divider()
@@ -501,8 +537,22 @@ if analyze:
         with st.spinner('Finding material, calibrating rulers, and segmenting visible regions…'):
             wr,wm,wmsg=read_uploaded(wet_file.getvalue())
             dr,dm,dmsg=read_uploaded(dry_file.getvalue())
-            wet=detect_regions(wr,wm)
-            dry=detect_regions(dr,dm)
+            if wet_ten_mm > 0:
+                original=Image.open(io.BytesIO(wet_file.getvalue()))
+                original=ImageOps.exif_transpose(original)
+                scale=wr.shape[1]/original.width
+                wm=10.0/(wet_ten_mm*scale)
+                wmsg=f'Manual calibration: {wet_ten_mm*scale:.1f} resized pixels / 10 mm.'
+            if dry_ten_mm > 0:
+                original=Image.open(io.BytesIO(dry_file.getvalue()))
+                original=ImageOps.exif_transpose(original)
+                scale=dr.shape[1]/original.width
+                dm=10.0/(dry_ten_mm*scale)
+                dmsg=f'Manual calibration: {dry_ten_mm*scale:.1f} resized pixels / 10 mm.'
+            wb=(wet_x[0]/100,wet_y[0]/100,wet_x[1]/100,wet_y[1]/100)
+            db=(dry_x[0]/100,dry_y[0]/100,dry_x[1]/100,dry_y[1]/100)
+            wet=detect_regions(wr,wm,wb)
+            dry=detect_regions(dr,dm,db)
             cuts=assign_classes(wet,dry)
             figs=make_figures(wet,dry,cuts)
             df=table_rows(wet,dry)
