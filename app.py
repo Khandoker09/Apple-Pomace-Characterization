@@ -2,7 +2,7 @@
 1. Automatic tray-guided material mask
 2. Mean candidate-region area reduction
 3. Camera-based CIELAB color quality control
-4. Conservative candidate-region segmentation and size distribution
+4. Dual-scale candidate-region segmentation and multi-view size distribution
 
 Research limitation: these regions are not validated physical particles.
 Top-down photos do not measure thickness or volume.
@@ -195,36 +195,42 @@ def material_mask(rgb: np.ndarray):
     return foreground, interior, info
 
 
-def segmentation(rgb: np.ndarray, mask: np.ndarray):
-    """Conservative geometry-based candidate segmentation, not instance ground truth.
+def segmentation(rgb: np.ndarray, mask: np.ndarray, detail: bool = True):
+    """Automatic geometry-guided visible-region partition, NOT verified instances.
 
-    Find meaningful distance-transform maxima instead of individual bright pixels.
-    Connected/overlapping pieces can still be unresolved, so we retain a warning.
+    Detailed mode finds more local lobes and retains smaller disconnected pieces;
+    conservative mode suppresses weak peaks. Agreement between the two is a
+    diagnostic of algorithm sensitivity, not a probability of correctness.
     """
-    clean = remove_small_objects(mask.astype(bool), min_size=18)
-    clean = cv2.morphologyEx(clean.astype(np.uint8), cv2.MORPH_OPEN,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))) > 0
+    clean = remove_small_objects(mask.astype(bool), min_size=8 if detail else 18)
+    # Avoid morphological opening in detailed mode because it deletes thin
+    # individual peel fragments and changes the measured mask area.
+    if not detail:
+        clean = cv2.morphologyEx(clean.astype(np.uint8), cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))) > 0
     distance = ndi.distance_transform_edt(clean).astype(np.float32)
-    distance = ndi.gaussian_filter(distance, sigma=1.4)
-    seed_mask = h_maxima(distance, h=2.5) & (distance >= 3.2)
+    distance = ndi.gaussian_filter(distance, sigma=0.85 if detail else 1.4)
+    seed_mask = h_maxima(distance, h=1.15 if detail else 2.5) & \
+                (distance >= (1.7 if detail else 3.2))
     _, markers = cv2.connectedComponents(seed_mask.astype(np.uint8), 8)
     if markers.max() < 1:
         _, labels = cv2.connectedComponents(clean.astype(np.uint8), 8)
     else:
+        # The watershed only separates areas where pixels were already
+        # material-classified. Texture alone cannot reveal hidden particles.
         labels = watershed(-distance, markers, mask=clean, watershed_line=False)
-    # Remove very small spurious patches and compact IDs, preserving visible area
-    kept = [p for p in regionprops(labels) if p.area >= 26]
+    kept = [region for region in regionprops(labels) if region.area >= (9 if detail else 26)]
     lut = np.zeros(int(labels.max()) + 1, dtype=np.int32)
-    for i, p in enumerate(kept, 1):
-        lut[p.label] = i
+    for i, region in enumerate(kept, 1):
+        lut[region.label] = i
     labels = lut[labels]
-    props = regionprops(labels)
-    return labels, np.array([p.area for p in props], dtype=np.float64)
+    return labels, np.array([region.area for region in regionprops(labels)], dtype=np.float64)
 
 
 def analyze(rgb: np.ndarray, mm_per_px: float | None) -> dict:
     material, tray, details = material_mask(rgb)
-    labels, areas_px2 = segmentation(rgb, material)
+    labels, areas_px2 = segmentation(rgb, material, detail=True)
+    coarse_labels, coarse_areas = segmentation(rgb, material, detail=False)
     lab_cv = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
     # OpenCV's uint8 Lab requires conversion: L*=L_cv*100/255, a*=a_cv-128, b*=b_cv-128
     mean_lab = np.array([
@@ -233,7 +239,8 @@ def analyze(rgb: np.ndarray, mm_per_px: float | None) -> dict:
         lab_cv[:, :, 2][material].mean() - 128,
     ], dtype=float)
     return dict(rgb=rgb, mask=material, tray=tray, info=details, labels=labels,
-                region_px2=areas_px2, mm_per_px=mm_per_px, lab=mean_lab)
+                region_px2=areas_px2, coarse_labels=coarse_labels,
+                coarse_region_px2=coarse_areas, mm_per_px=mm_per_px, lab=mean_lab)
 
 
 def visual_overlay(r: dict) -> np.ndarray:
@@ -248,10 +255,10 @@ def visual_overlay(r: dict) -> np.ndarray:
 
 
 
-def colored_region_overlay(result: dict, show_numbers: bool = True) -> np.ndarray:
+def colored_region_overlay(result: dict, show_numbers: bool = True, conservative: bool = False) -> np.ndarray:
     """Display individual watershed candidate regions with stable ID labels."""
     rgb = result['rgb'].copy()
-    labels = result['labels']
+    labels = result['coarse_labels'] if conservative else result['labels']
     count = int(labels.max())
     if count == 0:
         return rgb
@@ -361,6 +368,48 @@ def area_weighted_figure(df: pd.DataFrame, area_column: str) -> Figure:
     return fig
 
 
+def cumulative_distribution_figure(df: pd.DataFrame, area_column: str) -> Figure:
+    """Empirical CDF: share of regions whose area does not exceed a threshold."""
+    fig = Figure(figsize=(9.5, 4.6), dpi=110, facecolor='white')
+    ax = fig.add_subplot(111)
+    for cond, color in [('Wet', '#007F90'), ('Dry', '#C66A34')]:
+        values = np.sort(df.loc[df['Condition'] == cond, area_column].to_numpy(dtype=float))
+        values = values[np.isfinite(values) & (values > 0)]
+        if values.size:
+            ax.step(values, 100*np.arange(1, len(values)+1)/len(values),
+                    where='post', label=cond, color=color, lw=2)
+    ax.set_xscale('log')
+    ax.set_ylim(0, 100)
+    ax.set_xlabel(f'Region area (log scale; {"mm²" if "mm²" in area_column else "px²"})')
+    ax.set_ylabel('Regions with area at or below threshold (%)')
+    ax.set_title('Cumulative region-size distribution (ECDF)', loc='left')
+    ax.grid(alpha=.2)
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    return fig
+
+
+def region_boxplot_figure(df: pd.DataFrame, area_column: str) -> Figure:
+    """Show center, spread and outliers without hiding large regions."""
+    fig = Figure(figsize=(9, 4.5), dpi=110, facecolor='white')
+    ax = fig.add_subplot(111)
+    series = [df.loc[df['Condition']==name, area_column].to_numpy(dtype=float)
+              for name in ('Wet', 'Dry')]
+    series = [a[np.isfinite(a) & (a > 0)] for a in series]
+    if all(len(a) for a in series):
+        bx = ax.boxplot(series, patch_artist=True, labels=['Wet','Dry'],
+                        showmeans=True, meanline=True, showfliers=True)
+        for patch, color in zip(bx['boxes'], ['#007F90','#C66A34']):
+            patch.set_facecolor(color)
+            patch.set_alpha(.5)
+        ax.set_yscale('log')
+    ax.set_ylabel(f'Region area ({"mm²" if "mm²" in area_column else "px²"}; log scale)')
+    ax.set_title('Area variability: median, quartiles, mean and outliers', loc='left')
+    ax.grid(axis='y', alpha=.2)
+    fig.tight_layout()
+    return fig
+
+
 def class_counts(df: pd.DataFrame) -> pd.DataFrame:
     categories = ['Small', 'Medium', 'Large']
     return pd.DataFrame({
@@ -389,6 +438,7 @@ def make_export(w: dict, d: dict, shared_scale: float | None, report: dict, regi
                                                   .astype(np.uint8).repeat(3, axis=2)))
             z.writestr(f'{name}_overlay.png', png(visual_overlay(r)))
             z.writestr(f'{name}_numbered_regions.png', png(colored_region_overlay(r)))
+            z.writestr(f'{name}_conservative_regions.png', png(colored_region_overlay(r, conservative=True)))
             for i, a in enumerate(r['region_px2'], 1):
                 rows.append(dict(condition=name, candidate_region_id=i,
                                  area_px2=float(a),
@@ -405,11 +455,17 @@ def make_export(w: dict, d: dict, shared_scale: float | None, report: dict, regi
         plot2 = io.BytesIO()
         area_fig.savefig(plot2, format='png', dpi=130)
         z.writestr('area_weighted_distribution.png', plot2.getvalue())
+        for title, func in [('cumulative_distribution.png', cumulative_distribution_figure),
+                            ('region_boxplot.png', region_boxplot_figure)]:
+            f = func(regions, 'Area (mm²)' if shared_scale else 'Area (px²)')
+            file = io.BytesIO()
+            f.savefig(file, format='png', dpi=130)
+            z.writestr(title, file.getvalue())
     return stream.getvalue()
 
 st.set_page_config(page_title='DryMatter Vision | Four Measures', page_icon='🔬', layout='wide')
 st.title('DryMatter Vision')
-st.caption('Automatic material mask · mean area reduction · color quality control · individual-region distribution')
+st.caption('Automatic material mask · mean area reduction · color quality control · detailed region maps and multi-view distributions')
 with st.sidebar:
     st.header('Upload photographs')
     wet_file = st.file_uploader('Wet / Before', type=['jpg','jpeg','png','webp','tif','tiff'], key='wet')
@@ -519,8 +575,8 @@ with color_tab:
 regions = region_measurements(w, d, mm)
 area_column = 'Area (mm²)' if mm is not None else 'Area (px²)'
 with particle_tab:
-    st.subheader('Numbered candidate regions')
-    st.caption('Distance-based watershed splits some narrow connections while suppressing false brightness peaks. Colored patches are candidates, not proven separate physical particles; overlapping pieces may remain merged.')
+    st.subheader('Detailed candidate-region map')
+    st.caption('Detailed shape-based segmentation retains more small fragments. Every colored patch is a candidate, not a verified particle. Stacked or touching pieces can remain merged; some textured pieces can split.')
     wet_col, dry_col = st.columns(2)
     with wet_col:
         st.markdown(f'**WET — {nw} regions**')
@@ -528,9 +584,23 @@ with particle_tab:
     with dry_col:
         st.markdown(f'**DRY — {nd} regions**')
         st.image(colored_region_overlay(d), use_container_width=True)
+    st.subheader('Algorithm sensitivity — detailed versus conservative')
+    st.dataframe(pd.DataFrame([
+        {'Condition':'Wet','Detailed regions':nw,'Conservative regions':int(w['coarse_labels'].max())},
+        {'Condition':'Dry','Detailed regions':nd,'Conservative regions':int(d['coarse_labels'].max())},
+    ]),hide_index=True,use_container_width=True)
+    with st.expander('See conservative segmentation maps (fewer splits)'):
+        cc1, cc2 = st.columns(2)
+        cc1.image(colored_region_overlay(w, conservative=True), use_container_width=True)
+        cc2.image(colored_region_overlay(d, conservative=True), use_container_width=True)
+    st.warning('The gap between detailed and conservative region counts measures sensitivity to segmentation settings. It is not a confidence interval. Overlapping hidden fragments cannot be counted reliably from one overhead photograph.')
     st.subheader('Region area distribution')
     st.pyplot(distribution_figure(regions, area_column), use_container_width=True)
     st.caption('Number-based histogram: the height of a bin counts candidate regions in that area range. Values above the 99th percentile are included in the final bin for display; CSV retains exact values.')
+    st.pyplot(cumulative_distribution_figure(regions, area_column), use_container_width=True)
+    st.caption('Cumulative curve: for any chosen area, read what fraction of regions are that size or smaller. A left-shift indicates smaller measured regions.')
+    st.pyplot(region_boxplot_figure(regions, area_column), use_container_width=True)
+    st.caption('Box plot: shows the median, spread, and unusually large regions. Outliers often deserve review for possible merging.')
     st.pyplot(area_weighted_figure(regions, area_column), use_container_width=True)
     st.caption('Area-weighted view: shows which size class accounts for the greatest proportion of segmented region area.')
     st.subheader('Shared size-class distribution')
@@ -558,7 +628,8 @@ report = {
     'delta_E76': delta_e,
     'delta_Lab': delta_lab.tolist(),
     'size_class_distribution': class_counts(regions).to_dict(orient='records'),
-    'limitation':'2D camera masks; geometry-based watershed candidate regions are not verified physical particles. Overlaps remain unresolved and no 3D volume shrinkage is inferred.'
+    'sensitivity': {'wet_conservative_count': int(w['coarse_labels'].max()), 'dry_conservative_count': int(d['coarse_labels'].max())},
+    'limitation':'2D camera masks; watershed candidates are not verified physical particles. Overlaps remain unresolved; more detailed splitting is not proof of correctness. No 3D volume shrinkage is inferred.'
 }
 st.download_button('Download masks, numbered regions, distributions and report (ZIP)',
                    make_export(w,d,mm,report,regions), file_name='DryMatter_Vision_Results.zip',
